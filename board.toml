@@ -1,0 +1,306 @@
+# Board description of the Huawei MatePad 11 (DBY-W09, SM8250 / kona), read by the unixnu build driver.
+
+[board]
+name = "dby_w09"
+soc = "SM8250"
+description = "Huawei MatePad 11"
+kit = "dby_w09"                    # the package/ of this repository appears as kits/dby_w09 in the build tree
+
+# ---------------------------------------------------------------------------
+# IPSW：目标 = iPad7,1（iPad Pro 11 第1代 / 12.9 第3代，2018）iPadOS 17.7.11。
+#   与 sheng 完全相同的已验证 target（UniXNU 官方唯一适配的组合）。
+#   chip_id=0x8011（T8011/A11）/ board_id=12 / device_class=j120ap。
+#   整条 XNU 预链接 / ADT / PMGR 契约 / Metal 桥接都按这一组合写死，
+#   换任何其他型号都要从零重做 target 适配，故先沿用 iPad7,1 跑通全链路。
+# ---------------------------------------------------------------------------
+[ipsw]
+url = "https://updates.cdn-apple.com/2025SpringFCS/fullrestores/122-77166/DCA6CFE8-90E9-4B92-880D-3DE171798E40/iPad_Pro_HFR_17.7.11_21H461_Restore.ipsw"
+product = "iPad7,1"
+version = "17.7.11"
+build = "21H461"
+device_class = "j120ap"
+chip_id = 0x8011
+board_id = 12
+fetch = ["KernelCache", "DeviceTree", "StaticTrustCache", "Cryptex1,SystemTrustCache"]
+
+[ipsw.sha256]
+"044-76040-038.dmg" = "3f99b859c9728379110b66657c7b15285bcb1925ad8b5726542e2cdcf8b1028d"
+"044-76034-038.dmg" = "b4908cde41d23e6bc05e6af51a2c9eeb00cf0f863a6a18b1600c96a3fd70414f"
+
+# ---------------------------------------------------------------------------
+# userdata：已取证（9008 完整备份 gpt_main0.bin，LUN 0）。
+#   GPT header @ LBA 8 (offset 4096)，分区项 128B/条，num_parts=64。
+#   userdata 条目：first_lba=2733568 (0x29B600), last_lba=30692863 (0x1D455FF)。
+#   LBA 单位 4096 字节（整盘 = 30693376 LBA × 4096 = 117.09 GiB ≈ 128G UFS）。
+#   userdata 容量 = (30692863-2733568+1) × 4096 = 106.66 GiB。
+# ---------------------------------------------------------------------------
+[userdata]
+first_lba = 0x29B600
+last_lba = 0x1D455FF
+lba_bytes = 4096
+windows = [
+  { name = "OS", component = "OS" },
+  { name = "SystemOS", component = "Cryptex1,SystemOS" },
+]
+
+# ---------------------------------------------------------------------------
+# kernel：defconfig 在 configs/ 下。archives 是最小集（先不碰 GPU/显示/触摸的
+# sheng 专属驱动，那些是 SM8550/Adreno740 的，SM8250/Adreno650 不适用）。
+# 阶段 2→3 只验证「菜单 + 读 unixnu.toml + 负载可见」，不链接 XNU 内核，
+# 所以 archives 先空着，等真正进阶段 5（内核入口）再补。
+# ---------------------------------------------------------------------------
+[kernel]
+defconfig = "dby_w09_defconfig"
+# 官方顺序：驱动 recipe 先产归档，bindings 步骤再把 original 绝对地址对象加进同一个归档，
+# 因为内核链的是那个归档（build-xnu-4k-baseline.sh:673/723 的 -Wl,-force_load 路径）。
+archives = [
+  # NativeAES 是 NATIVE_VIRTIO_BLOCK 的硬前置；bindings 脚本没有活体审计时走
+  # scripts/data/native-aes-original-bindings.S 的录制回退（官方行为）。
+  "build-arm-driver.py NativeAES",
+  "build-native-aes-bindings.py",
+  # VERIFIED_ROOT_PROBE=1 在环境里（defconfig 经 xnu_env 传给 archives），所以这一步
+  # 不再编 -DNATIVE_UFS_PROBE_ONLY=1，NativeUfs::start() 里的 startRoot() 分支才会存在。
+  "build-arm-driver.py NativeUfs",
+  "build-storage-bindings.py --component NativeUfs --archive libNativeUfs.a --directory build/native-ufs",
+  # 策略选择器：导出 native_verified_block_root_authorized()，OWNER_ROOT_AUDIT 调它。
+  "build-arm-driver.py NativeVirtioBlock",
+  # 这个驱动只导入录制 union 的一部分，所以 --subset（未用的条目不算错），且写成 weak
+  # 定义，和先链的 NativeUfs 用同一批 original 地址而不是撞车。
+  "build-storage-bindings.py --component NativeVirtioBlock --archive libNativeVirtioBlock.a --directory build/native-virtio-block-verified-bundle --subset",
+  # DATA_MOUNT 的可写 /private/var 必须由 RamBlock 发布真 IOMedia（md0/memdev 路线实测失败：
+  # APFS 拒绝挂裸 memdev，内核 panic "offline scratch Data mount failed: 2"，见官方 alioth
+  # configs/alioth_defconfig:62-74 与 native_ram_block_volume_seed()）。
+  # 前置顺序同官方：先产归档，再往同一目录写 bindings.json（baseline:766-793 会拿它和
+  # virtio 的 11 个共用 original 符号逐条对拍，并要求 compiled_object_sha256 对上 NativeRamBlock.o）。
+  "build-arm-driver.py NativeRamBlock",
+  "build-storage-bindings.py --component NativeRamBlock --archive libNativeRamBlock.a --directory build/native-ram-block --subset",
+  # payload 的 native-ufs-root 硬门要求内核里有 _sheng_pmgr_run（官方 alioth 脚本 + 源文件，
+  # 原样拷在 scripts/ 与 package/，参考候选是 out/dby_w09/kernel/kernel.macho）。
+  "build-platform-power.py",
+  # libBootProgress.a 引用的 sheng 专属计数器在这里给零值定义：官方 CONFIG_XNU_EXTRA_LD_ARCHIVES
+  # 路线（baseline:812）+ alioth 官方 package/LinkStubs.c 与 BootProgressStubs.c（原样拷进本仓）。
+  "build-link-stubs.py",
+]
+
+[kernel.prelink]
+# 官方 schema: tool / kernel / slide / roots / kernelcache / early_security_init / extra_args
+tool = "kits/NativePrelink/emit_prelink.py"
+kernel = "build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837.unstripped.noctf"
+slide = "-0x1000000"
+kernelcache = "build/kc-arm64.macho"
+# AMFI 的早期初始化入口（官方 sheng/alioth 同一行，地址属于 donor 21H461 kernelcache 里
+# com.apple.driver.AppleMobileFileIntegrity 的 __TEXT_EXEC，未改动）。
+# kernel.py:124 把它原样传给 emit_prelink --early-security-init；emit_prelink.py:147-156 校验
+# 「必须是选进闭包的 AppleSecurityExtension、且落在该模块 rx 且不可写的 __TEXT_EXEC 内」，
+# 然后 emit_prelink.py:257-258 往该模块的 prelink info 条目写
+# _NativePrelinkEarlySecurityInit = address + slide。运行侧消费者是
+# kits/NativePrelink/patches/xnu-10063.141.1-security-init.patch 加进 OSKext.cpp 的那段：
+# kmodStart 返回后、mac_late 之前调用它，AMFI 的 kauth/exec 策略才在 launchd exec 之前注册。
+# 没有这一行，plan 的 early_security_initializers 就是空 {}（05:40 候选实测），
+# AMFI 即使被预链接进来也不会初始化 —— 这正是 exec 链断点。
+early_security_init = "com.apple.driver.AppleMobileFileIntegrity=0xfffffff005ab4ae0"
+# 真机需要的项：
+#   AppleARMPlatform —— 平台专家（ADT 解析、CPU/GIC）
+#   kec.corecrypto    —— PRNG/read_random，缺它会 _read_random 调空指针
+#   filesystems.apfs  —— 根容器文件系统。emit_prelink 只对 roots 闭包内的组件
+#     做指针重定位（plan 的 images_modified=false，未选中的模块保留原始地址），
+#     所以 patches/xnu/offline-component-load-probes.patch 的
+#     offline-apfs-load=1 读 OSKextLoadKextWithIdentifier("com.apple.filesystems.apfs")
+#     必须先把 apfs 选进闭包才能工作；它的依赖闭包同时带入
+#     com.apple.iokit.IOStorageFamily，那是 scripts/audit-storage-interface.py
+#     要求的 native-apfs-load-positive 候选。
+#   AppleMobileFileIntegrity + ApplePMGR —— 进 iOS 的硬前置，两项都是官方
+#     UniXNU-sheng/board.toml 与 community-components/UniXNU-alioth-ARCHIVE/board.toml
+#     roots 里的原行（iPad7,1/21H461 同一 donor）。缺它们时：
+#       1) scripts/audit-amfi-pmgr-contract.py:50-61 取不到这两枚的 __TEXT_EXEC extent，
+#          `extent, = [...]` 直接 ValueError: not enough values to unpack（07:0x 构建实测），
+#          于是 build-platform-power.py 产不出 libShengPlatformPower.a，
+#          payload 的 native-ufs-root 硬门（payload.py:46-52 要 _sheng_pmgr_run）也过不了；
+#       2) 内核里没有 AMFI 的代码，exec 时无人查 cdhash，签名策略无从绑定。
+#     合约要求 plan['original_executable_sha256'] 里 AMFI=a1088aaabc25…、PMGR=2c433279d004…
+#     （未改动的原始可执行段），同 donor 必然匹配；不匹配就是官方脚本拒收，不是我们绕过的理由。
+# 官方 UniXNU-sheng 的 31 项 roots 原样照搬（同一 donor：iPad7,1 / 21H461），
+# 不是我们的自选清单。AMFI 的 hash / trustcache / exec 链需要闭包里的
+# AppleImage4 + CoreTrust + AppleMatch + sandbox + IOSurface + IOStorageFamily +
+# IOCryptoAcceleratorFamily + AppleEffaceableStorage + AppleFSCompressionTypeZlib +
+# kec.Libm，缺一项就是 cs_validate_page / trust cache 查询在运行时找不到实现。
+roots = [
+  "com.apple.AppleFSCompression.AppleFSCompressionTypeZlib",
+  "com.apple.driver.AppleARMPlatform",
+  "com.apple.driver.AppleARMWatchdogTimer",
+  "com.apple.driver.AppleAudioClockLibs",
+  "com.apple.driver.AppleEffaceableStorage",
+  "com.apple.driver.AppleIISController",
+  "com.apple.driver.AppleM2ScalerCSCDriver",
+  "com.apple.driver.AppleMobileFileIntegrity",
+  "com.apple.driver.ApplePMGR",
+  "com.apple.driver.IODARTFamily",
+  "com.apple.filesystems.apfs",
+  "com.apple.iokit.CoreAnalyticsFamily",
+  "com.apple.iokit.IOAVFamily",
+  "com.apple.iokit.IOAudio2Family",
+  "com.apple.iokit.IOCECFamily",
+  "com.apple.iokit.IOCryptoAcceleratorFamily",
+  "com.apple.iokit.IOGPUFamily",
+  "com.apple.iokit.IOHDCPFamily",
+  "com.apple.iokit.IOMobileGraphicsFamily",
+  "com.apple.iokit.IOReportFamily",
+  "com.apple.iokit.IOSlowAdaptiveClockingFamily",
+  "com.apple.iokit.IOStorageFamily",
+  "com.apple.iokit.IOSurface",
+  "com.apple.kec.Libm",
+  "com.apple.kec.corecrypto",
+  "com.apple.kext.AppleMatch",
+  "com.apple.kext.CoreTrust",
+  "com.apple.security.AppleImage4",
+  "com.apple.security.sandbox",
+  "com.apple.iokit.IOHIDFamily",
+  "com.apple.iokit.IOHIDEventDriver",
+]
+
+# ---------------------------------------------------------------------------
+# firmware：对应我们已有的 Mu-Silicium UEFI 移植。
+#   uefi 源码在 D:\Linux\unixnu_uefi\（VM 的 /mnt/hgfs/linux/unixnu_uefi），
+#   平台包 pkg_dby_w09 → Platforms/Huawei/dby_w09Pkg，DSC = dby_w09.dsc。
+# 注意：我们的 uefi 移植是「从 sheng 的 Mu-Silicium 派生的离线包 + install 脚本铺包」，
+#   不是标准 uefi-<device> 仓库。所以这里的 dsc/fd 路径是「目标产物路径」，
+#   unixnu 的 firmware 构建步骤目前走不通（我们的编译链在 VM 里手动跑）。
+#   先把路径写对，等 uefi 移植整理成标准 uefi-dby_w09 仓库后再接 unixnu 的自动构建。
+# ---------------------------------------------------------------------------
+[firmware]
+config = "dby_w09"                 # Resources/Configs/dby_w09.toml
+dsc = "Platforms/Huawei/dby_w09Pkg/dby_w09.dsc"
+fd = "Build/dby_w09Pkg/{target}_CLANGPDB/FV/SILICIUM_UEFI.fd"
+preflight = ["scripts/check-dby_w09.py"]
+# submodules = ["Common/Mu", "Common/Mu_OEM_Sample", "Silicium-ACPI", "Silicon/Silicium/OpensslPkg/Library/OpensslLib/openssl"]
+patches = ["Resources/MuPatches/Gic-Spurious.patch"]
+packages = [
+  "{uefi}",
+  "{uefi}/Platforms/Huawei",
+  "{tree}/package",
+  "{tree}/drivers/DarwinBoot",
+  "{edk2}",
+  "{uefi}/Common/Mu",
+  "{uefi}/Common/Mu_OEM_Sample",
+  "{uefi}/Silicon/Qualcomm",
+  "{uefi}/Silicon/Silicium",
+  "{uefi}/Silicium-ACPI",
+  "{uefi}/Silicium-ACPI/Platforms/Huawei",
+  "{uefi}/Silicium-ACPI/Silicon/Qualcomm",
+]
+
+[firmware.defines]
+ENABLE_SECUREBOOT = "1"
+DEVICE_MODEL = "dby_w09"
+MEMORY_PROTECTION = "TRUE"
+SHIP_MODE = "FALSE"
+BUILDID_STRING = "dby_w09-research"
+
+# ---------------------------------------------------------------------------
+# payload：占位符。volume / size_mib / trust_cache / kernel_args 都要等选定
+# IPSW + 取证后才能填。当前先留最小骨架。
+# ---------------------------------------------------------------------------
+[payload]
+volume = "DBYW09ESP"
+size_mib = 208   # 官方 sheng board.toml 同值。带完整 AMFI 闭包的预链接内核放不进
+# cache 分区（实测 partition-size:cache = 0x6800000 = 104 MiB），所以负载卷按官方放在
+# userdata 的 ESP 上，由 unixnu build userdata 产出整盘镜像。
+loader = "firmware"
+title = "dby_w09 first boot: source 4K XNU to console"
+dram_size = "0x180000000"        # 6GiB = 0x180000000（待真机 SMEM RAM 表确认）
+skip_setup_tool = "scripts/seed-data-skip-setup.py"
+panic_screen = true
+# 空列表 = payload 里根本没有 trust cache，这本身就是进 iOS 的第一号死因（不是省事的默认值，
+# 是缺失的前置）：没有缓存时 DarwinBoot 不写 /chosen/memory-map/TrustCache，
+# load_static_trust_cache() 取到零长段，AMFI 里没有 launchd 的 cdhash，
+# mpo_cred_label_update_execve 置 ip_mac_return，内核以 OS_REASON_EXEC(9)/
+# EXEC_EXIT_REASON_SECURITY_POLICY(0x8) 杀掉 initproc。官方
+# scripts/check-ufs-original-trust-evidence.py:165 把这条记录成
+# 「genuine absent-trust refusal」：exec_policy_refusal = launchd, namespace 9, code 8。
+# 这里只登记未改动原始缓存组成的 bundle：scripts/build-original-system-trust.py
+# 从 refer/ 的 21H461 IPSW 取 Cryptex1,SystemTrustCache（自己解 IM4P，校验两枚 BuildManifest
+# Digest）+ .cache/firmware/target-volumes/static-trustcache.bin，两枚原始模块 sha256 写死为
+# da88460e6e51… / d121ba89167e…，要求 version-2 完整模块，不添加任何自有条目
+# （own_code_entries_added=false、original_modules_modified=false）。
+# bundle = struct '<3I'(2,12,12+len(static))+static+system，其 sha256 就是官方 sheng/alioth
+# 都登记的第一枚 7416ca4f8377…（make-owner-trust-bundle.py:191 用同一枚做自检）。
+# 传入方式：./unixnu build payload dby_w09 --trust-cache build/original-static-system-trust/original-static-system.bundle
+trust_cache_sha256 = [
+  "7416ca4f8377146626bb284e2133c76bee6cb4e3ee0af5d648b186235a7323a7",
+  "8900d6a93d7a59ce1a872a5c081e559f4240a218f97e12d44d22dda46644d68f",
+]
+kernel_args = [
+  "-v",
+  "serial=3",
+  "debug=0x14e",
+  "sheng-smp=1",
+  "offline-legacy-register=1",
+  "offline-legacy-gop=1",
+  "offline-legacy-validate=1",
+  "offline-legacy-retire=1",
+  "boot-progress=2",
+  "offline-apfs-load=1",
+  "offline-mobile-graphics-load=1",
+  "-apfs_shared_datavolume",
+  "native-ufs-stream=0xe0",
+  "native-ufs-stream2=0x4e0",
+  # 根设备发布门（NativeUfs.cpp start()：`if (rootMode && !probe) return startRoot(provider)`）。
+  # probe=10 是只读取证，和 root 互斥（start() 里 probe 存在时 rootMode 分支不走），
+  # 所以这里必须用 native-ufs-root=1 取代 native-ufs-probe=10，否则永远不发布 IOMedia。
+  "native-ufs-root=1",
+  # AMFI 硬门：payload.py:46-52 要求 native-ufs-root=1 时恰好一个 sheng-pmgr=2，
+  # 且内核里链了 _sheng_pmgr_run（archives 的 build-platform-power.py），
+  # 否则原封不动的目标 AMFI 会 panic "No PMGR"。
+  "sheng-pmgr=2",
+  # 官方 alioth 实测：watchdogd 因 Data 卷没有 role 而 BRK #1，com.apple.watchdogd.plist 的
+  # _PanicOnCrash 会把这一下升级成内核 panic。Data 挂载还没打开（见 defconfig），
+  # 所以这一步先按官方的 bring-up 做法抑制 crash panic，好让 initproc 之后的失败可读。
+  "panic_on_crash_disabled=1",
+  # 以下每一项都对应本轮从官方 core 补进树里的补丁，参数本身由补丁里的代码读取：
+  #  zzy-staged-system-apps.patch  -> sheng-staged-apps=1（把 OS 卷 /private/var/staged_system_apps
+  #    里的系统 App 复制进 Data 卷，launchd 之后才有 SpringBoard/Settings 可启）
+  #  zzyb-native-cryptex-os-view.patch -> 提供 SystemOS cryptex 视图，配合 -apfs_shared_datavolume
+  #  zzyc-owner-skip-launch-constraints.patch -> 放宽 launch constraints，让原始 iPadOS 用户态可 exec
+  #  boot-ui-focus4=SpringBoard / kt_fixed_zones=120 / offline-legacy-* 是官方 sheng 同一行的启动参数
+  "kt_fixed_zones=120",
+  "offline-legacy-unit-scale=2",
+  "offline-legacy-pm=1",
+  "offline-legacy-transfer=1",
+  "offline-legacy-cpu-present=1",
+  "offline-legacy-phase=4",
+  "offline-mobile-graphics-client=1",
+  "offline-hid-home=1",
+  "offline-hid-input=1",
+  "offline-key-events=1",
+  "boot-ui-focus4=SpringBoard",
+  "sheng-staged-apps=1",
+  "sheng-data-persist=2",
+  "sheng-disable-watchdogd=1",
+  "sheng-disable-jobs=com.apple.identityservicesd,com.apple.locationd,com.apple.CommCenter,com.apple.bluetoothd",
+  "armcpu-diagnostics=1",
+  "boot-diag-resume=10",
+  "sheng-lite=1",
+  "armcpu-spi-ipi=1",
+  "-no_slto_panic",
+]
+
+[payload.adt]
+# DarwinBoot 连续内存窗口：不写就是 DarwinBoot.c:593 的 256 MiB 默认窗口，XNU 只能拿到 256 MiB。
+# 值取同 SM8250 的官方 alioth 板：owned_memory_size = 0x100000000（4 GiB）。
+owned_memory_size = "0x100000000"   # alioth (same SM8250) official 4 GiB DarwinBoot window; absent means the 256 MiB default
+root_match_volume_uuid = "04769D26-2CA0-4825-B443-E2E5F88300F2"
+tool = "scripts/make-dby_w09-adt.py"
+cpu_regs = "0,0x100,0x200,0x300,0x400,0x500,0x600,0x700"
+psci_method = "smc"
+chip_id = "207"
+unique_chip_id = "required"
+ipad_identity = true
+# 这里必须 false：内核镜像里 "DBRDISK1" 出现 0 次，没有任何代码读扩展表；ADT 写
+# PackedRAMDisk 时 DarwinBoot 只在 KeepPacked 分支原样搬运（DarwinBoot.c:592/673/676），
+# 内核拿到的就是带 DBRDISK1 头的字节，无法当 APFS 容器挂。
+# RAMDisk 分支才是对的：DarwinBoot.c:674-675 CopyRamdisk(..., RamdiskPacked) 会在窗口里把
+# DBRDISK1 展开成裸 APFS 容器（RamdiskExpandedSize），所以负载里可以放体积更小的 .dbr
+# （seed-data-skip-setup.py 只能产出 packed，展开由固件做）。
+# 同 SoC 的官方 alioth board.toml:382 也是 packed_data_ramdisk = false，理由同。
+packed_data_ramdisk = false
+persistent_data = true
