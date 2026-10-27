@@ -149,19 +149,24 @@ jobs:
           path = Path('scripts/seed-data-grow.py')
           src = path.read_text()
           # scripts/seed-data-grow.py:107 captures the whole-disk node hdiutil reports (diskN) and :112 requires a
-          # PhysicalStores[].DeviceIdentifier exactly equal to it. A hdiutil disk image is published with a synthesized
-          # partition (diskNs1), so on a runner that comparison can never succeed and every grow stopped at
-          # ":115 No APFS container found on the attached seed". Comparing the whole disk of that identifier is the only
-          # change to the official sequence: hdiutil attach, diskutil apfs resizeContainer <container> 0 and the repack
-          # all stay, and the prefix match still excludes the runner's own APFS system container. The other edits only
-          # name the devices a run saw and stop swallowing diskutil's stderr, which is what made the failure undiagnosable.
+          # PhysicalStores[].DeviceIdentifier exactly equal to it. Run #3 (2026-10-28) printed what a hdiutil disk
+          # image actually publishes: the seed is attached as /dev/disk10 with /dev/disk10s1 typed 41504653 ("APFS"),
+          # and diskutil apfs list reports it as container disk10 whose physical store is disk9 — a disk image has two
+          # device nodes, the UDIF one hdiutil names and the backing one the APFS stack uses. Neither "disk10s1" nor
+          # "disk9" equals "disk10", so the official comparison can never succeed on an image and every grow stopped
+          # at ":115 No APFS container found on the attached seed". Matching the container whose ContainerReference is
+          # the attached node (or whose physical store lives on it) is the only change to the official sequence:
+          # hdiutil attach, diskutil apfs resizeContainer <container> 0 and the repack all stay. The runner's own
+          # system containers (disk0s1/disk0s2/disk3/disk5/disk7s1) match neither, so the seed is still the only hit.
+          # The other edits only name the devices a run saw and stop swallowing diskutil's stderr, which is what made
+          # the failure undiagnosable. Each anchor must appear exactly once.
           edits = [
             ("def run(*args):\n    return subprocess.run(args, check=True, capture_output=True, text=True).stdout\n",
              "def run(*args):\n    result = subprocess.run(args, capture_output=True, text=True)\n    if result.returncode:\n        sys.exit(str(args) + ' failed ' + str(result.returncode) + ' out=' + result.stdout + ' err=' + result.stderr)\n    return result.stdout\n"),
             (".split('/')[-1]\n",
              ".split('/')[-1]\n        print('grow: attached', attached.strip(), 'store', store, flush=True)\n"),
             ("                if any(s['DeviceIdentifier'] == store for s in entry.get('PhysicalStores', [])):\n                    container = entry['ContainerReference']\n",
-             "                for physical in entry.get('PhysicalStores', []):\n                    print('grow: container', entry['ContainerReference'], 'store', physical['DeviceIdentifier'], 'size', physical.get('Size'), flush=True)\n                    if re.match(r'disk\\d+', physical['DeviceIdentifier']).group(0) == store:\n                        container = entry['ContainerReference']\n"),
+             "                for physical in entry.get('PhysicalStores', []):\n                    print('grow: container', entry['ContainerReference'], 'store', physical['DeviceIdentifier'], 'size', physical.get('Size'), flush=True)\n                    if entry['ContainerReference'] == store or re.match(r'disk\\d+', physical['DeviceIdentifier']).group(0) == store:\n                        container = entry['ContainerReference']\n"),
             ("                sys.exit('No APFS container found on the attached seed')",
              "                sys.exit('No APFS container found on the attached seed ' + store + ' (see the grow: lines above)')"),
             ("            run('diskutil', 'apfs', 'resizeContainer', container, '0')",
