@@ -16,7 +16,6 @@
       "sha256": "b4908cde41d23e6bc05e6af51a2c9eeb00cf0f863a6a18b1600c96a3fd70414f"
     }
   ],
-  "userdata_bytes": 114521276416,
   "flash_command": "fastboot flash userdata /home/wqsqw/unixnu/UniXNU/build/userdata/userdata-root.img",
   "hardware_tested": false
 }
