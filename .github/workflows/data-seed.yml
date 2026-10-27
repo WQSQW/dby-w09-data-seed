@@ -19,7 +19,7 @@ on:
         required: true
         default: main
       grow:
-        description: Grow the seed to the tablet's userdata size (scripts/seed-data-grow.py --auto)
+        description: Grow the seed to the size given below (scripts/seed-data-grow.py --gib)
         type: boolean
         default: true
       skip_setup:
@@ -30,13 +30,13 @@ on:
         description: Also disable auto-dim and idle sleep in the seed (the tablet has no input driver yet)
         type: boolean
         default: true
-      userdata_bytes:
+      grow_gib:
         description: >-
-          This tablet's live partition-size:userdata, from "fastboot getvar partition-size:userdata" (hex 0x... or
-          decimal). Nothing is committed: the seed is sized from the board it is being made for, and partition sizes
-          differ per device (this one was re-partitioned).
+          GiB to grow the seed to (scripts/seed-data-grow.py --gib N; docs/guide/userdata.md:63 uses 8). It is a
+          porting decision recorded with the image, not a device read-out: the size has to fit the target Data
+          allocation after root windows, store metadata and log reservations.
         required: true
-        default: ''
+        default: '8'
 
 permissions:
   contents: read
@@ -142,16 +142,15 @@ jobs:
           python3 drivers/DarwinBoot/Test/packed_ramdisk.py \
             build/owner-data-fixture/owner-data-32.cdr "$RUNNER_TEMP/data-32.dbr"
 
-      - name: Grow the seed to the tablet's storage
+      - name: Grow the seed to the recorded size
         if: inputs.grow
         run: |
-          # docs/devices/sheng.md:261 is the official instruction for using the tablet's full storage: --auto.
-          # --auto needs the root image size (build/userdata-root/userdata-root.json) and the partition capacity.
-          # scripts/seed-data-grow.py:36 userdata_bytes_from_fastboot() asks the tablet itself with
-          # `fastboot getvar partition-size:userdata`; a runner has no tablet attached, so the host reads that value
-          # and passes it as the userdata_bytes input. Nothing device-specific is committed: partition sizes differ
-          # per board, and the constant this workflow used until run #4 (114521276416) was larger than the live
-          # partition on this tablet (fastboot reports partition-size:userdata 0x14651E0000 = 86991831040).
+          case '${{ inputs.grow_gib }}' in ''|*[!0-9]*) echo "grow_gib must be a whole number of GiB"; exit 1;; esac
+          # docs/guide/userdata.md:60-75 is the official sizing instruction: `--gib N` (its own example is 8) and
+          # "choose a size that fits the target Data allocation after root windows, store metadata and log
+          # reservations", then "record the selected size and root report with the image". --auto is documented as the
+          # extra mode that queries a tablet in fastboot for userdata capacity; that number belongs to whichever board
+          # happens to be attached, so this workflow does not use it and nothing device-specific is committed.
           mkdir -p build/userdata-root
           cp device/userdata-root.json build/userdata-root/userdata-root.json
           python3 - <<'PY'
@@ -190,11 +189,7 @@ jobs:
           path.write_text(src)
           PY
           git --no-pager diff --stat scripts/seed-data-grow.py
-          USERDATA='${{ inputs.userdata_bytes }}'
-          [ -n "$USERDATA" ] || { echo "grow=true needs the userdata_bytes input (fastboot getvar partition-size:userdata)"; exit 1; }
-          echo "grow: sizing from partition-size:userdata = $USERDATA"
-          python3 scripts/seed-data-grow.py --auto \
-            --userdata-bytes "$USERDATA" \
+          python3 scripts/seed-data-grow.py --gib '${{ inputs.grow_gib }}' \
             "$RUNNER_TEMP/data-32.dbr" "$RUNNER_TEMP/data-grow.dbr"
 
       - name: Mark Setup as done
