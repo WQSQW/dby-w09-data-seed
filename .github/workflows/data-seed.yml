@@ -4,8 +4,10 @@ name: Data seed (macOS)
 # formats an APFS container with hdiutil and reads it back with diskutil, both macOS-only. Everything here is the
 # upstream command sequence (docs/guide/userdata.md, docs/guide/skip-setup.md, .github/workflows/macos.yml); the
 # only deviation from upstream policy is that the finished seed is uploaded as an artifact, so a Linux porter can
-# flash it. Upstream uploads text logs only ("they derive from Apple software"), so this repository is private and
-# the artifact lives one day.
+# flash it. Upstream uploads text logs only ("they derive from Apple software"): the fixture really does copy the
+# original private/var regular files out of the Apple OS volume, so THIS REPOSITORY MUST BE PRIVATE. As of
+# 2026-10-28 it is still public (a fine-grained PAT cannot change visibility: PATCH /repos returns 403 "Resource
+# not accessible by personal access token"), which has to be fixed in the web UI. Artifact retention is 1 day.
 
 on:
   workflow_dispatch:
@@ -18,6 +20,15 @@ on:
         description: UniXNU ref to build the seed with
         required: true
         default: main
+      base_seed:
+        description: >-
+          Run ID whose data-32.dbr to grow instead of formatting a fresh fixture. scripts/seed-data-grow.py
+          preserves the volume UUID (docs/guide/userdata.md: "The volume UUID is preserved, but changing the seed
+          size changes its persistence identity"), and the kernel looks the seed up by that UUID
+          (kern_exec.c:7993 native_ram_block_volume_seed(XNU_OWNER_DATA_VOLUME_UUID, ...)), so growing a recorded
+          seed needs no kernel rebuild while a fresh fixture always does. Empty = format a new one.
+        type: string
+        default: ''
       grow:
         description: Grow the seed to the size given below (scripts/seed-data-grow.py --gib)
         type: boolean
@@ -40,6 +51,8 @@ on:
 
 permissions:
   contents: read
+  # Needed only to download this repository's own previous seed when base_seed names a run.
+  actions: read
 
 concurrency:
   group: data-seed-${{ github.ref }}
@@ -96,13 +109,57 @@ jobs:
           git --version
           df -h "$GITHUB_WORKSPACE"
 
+      - name: Restore the seed recorded by a previous run
+        if: inputs.base_seed != ''
+        run: |
+          # The base seed is fetched from our own previous artifact rather than committed: it contains the original
+          # private/var files copied out of the Apple OS volume, so it must not enter the repository tree.
+          echo "growing the data-32.dbr published by run ${{ inputs.base_seed }}"
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: inputs.base_seed != ''
+        with:
+          name: unixnu-dby-w09-data-seed-${{ inputs.base_seed }}-1
+          run-id: ${{ inputs.base_seed }}
+          path: base-seed
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Select the base seed
+        if: inputs.base_seed != ''
+        run: |
+          # drivers/DarwinBoot/Test/packed_ramdisk.py is used by the grow and skip-setup steps; it is a submodule
+          # and the "Pack the seed" step that normally initialises it is skipped in this mode.
+          git submodule update --init --depth 1 drivers/DarwinBoot
+          base=$(find base-seed -name data-32.dbr -print -quit)
+          [ -n "$base" ] || { echo "::error::no data-32.dbr in the artifact of run ${{ inputs.base_seed }}"; exit 1; }
+          # Grow the pre-Setup container so the documented order holds (docs/guide/skip-setup.md:34: grow first,
+          # then the payload edits the grown seed and keeps its size).
+          cp "$base" "$RUNNER_TEMP/data-32.dbr"
+          stat -f '%z %N' "$RUNNER_TEMP/data-32.dbr"
+          shasum -a 256 "$RUNNER_TEMP/data-32.dbr"
+          # The DBRDISK1 header itself records the logical size and content hash, so the base is checked rather
+          # than trusted: growing a corrupt seed would only be visible as a mount failure on the board.
+          python3 - <<'PY'
+          import os
+          import sys
+          from pathlib import Path
+          sys.path.insert(0, 'drivers/DarwinBoot/Test')
+          import packed_ramdisk
+          # inspect() returns (metadata, the first page); only the metadata is printed.
+          print('base seed', packed_ramdisk.inspect(Path(os.environ['RUNNER_TEMP']) / 'data-32.dbr')[0])
+          PY
+          json=$(find base-seed -name seed.json -print -quit)
+          [ -n "$json" ] && { echo 'the volume UUID this run keeps:'; grep volume_uuid "$json"; }
+
       - name: Fetch the OS volume from the target IPSW
+        if: inputs.base_seed == ''
         run: |
           # Range-reads the member, never the whole IPSW, and enforces the [ipsw.sha256] pin of the board.
           ./unixnu ipsw -D "$UNIXNU_DEVICE" fetch OS
           ls -l out/ipsw/*/
 
       - name: Attach the OS volume read-only
+        if: inputs.base_seed == ''
         run: |
           dmg=$(ls "$PWD"/out/ipsw/*/044-76040-038.dmg)
           mkdir -p .cache/firmware/target-volumes/os-mount
@@ -129,12 +186,14 @@ jobs:
           PY
 
       - name: Create the Data seed
+        if: inputs.base_seed == ''
         run: |
           # Refuses unless .cache/firmware/target-volumes/os-mount/sbin/launchd is the unchanged original.
           python3 scripts/prepare-owner-data-fixture.py --output build/owner-data-fixture
           cat build/owner-data-fixture/seed.json
 
       - name: Pack the seed into DBRDISK1
+        if: inputs.base_seed == ''
         run: |
           # seed-data-grow.py and seed-data-skip-setup.py both take a packed base; the fixture output is dense raw APFS.
           git submodule update --init --depth 1 drivers/DarwinBoot
@@ -231,8 +290,8 @@ jobs:
             [ -f "$f" ] || continue
             printf '%s %s %s\n' "$(basename "$f")" "$(stat -f %z "$f")" "$(shasum -a 256 "$f" | cut -d' ' -f1)"
           done
-          stat -f '%N %z' build/owner-data-fixture/owner-data-32.cdr
-          shasum -a 256 build/owner-data-fixture/owner-data-32.cdr
+          stat -f '%N %z' build/owner-data-fixture/owner-data-32.cdr 2>/dev/null || echo 'no fresh fixture: this run grew the base seed'
+          shasum -a 256 build/owner-data-fixture/owner-data-32.cdr 2>/dev/null || true
 
       - name: Upload the Data seed
         if: always()
@@ -269,7 +328,13 @@ jobs:
             echo 'container is not, so packed_data_ramdisk = false is only ever a small-seed workaround.'
             echo
             echo '`build/owner-data-fixture/seed.json` carries the volume UUID the kernel needs in'
-            echo 'CONFIG_XNU_OWNER_DATA_VOLUME_UUID (build-xnu-4k-baseline.sh:499-514).'
+            echo 'CONFIG_XNU_OWNER_DATA_VOLUME_UUID (build-xnu-4k-baseline.sh:499-524 writes it into'
+            echo 'build/xnu/owner-data-volume.h, and kern_exec.c:7993 looks the seed up by exactly that string:'
+            echo 'a seed whose UUID differs makes the board panic `offline scratch Data mount failed: 2`).'
+            echo
+            echo 'So a fresh fixture always costs a kernel rebuild, while a seed grown from a recorded base keeps'
+            echo 'its UUID (docs/guide/userdata.md) and can ship as a payload-only change. When base_seed names a'
+            echo 'run, no new fixture is formatted and this run inherits that run'"'"'s UUID.'
             echo 'Artifact retention is 1 day. No Apple image is uploaded, only the seed.'
           } >> "$GITHUB_STEP_SUMMARY"
 
