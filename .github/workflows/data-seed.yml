@@ -30,6 +30,13 @@ on:
         description: Also disable auto-dim and idle sleep in the seed (the tablet has no input driver yet)
         type: boolean
         default: true
+      userdata_bytes:
+        description: >-
+          This tablet's live partition-size:userdata, from "fastboot getvar partition-size:userdata" (hex 0x... or
+          decimal). Nothing is committed: the seed is sized from the board it is being made for, and partition sizes
+          differ per device (this one was re-partitioned).
+        required: true
+        default: ''
 
 permissions:
   contents: read
@@ -139,8 +146,12 @@ jobs:
         if: inputs.grow
         run: |
           # docs/devices/sheng.md:261 is the official instruction for using the tablet's full storage: --auto.
-          # --auto needs build/userdata-root/userdata-root.json (the root image size) and the partition capacity,
-          # both of which come from our own userdata build report.
+          # --auto needs the root image size (build/userdata-root/userdata-root.json) and the partition capacity.
+          # scripts/seed-data-grow.py:36 userdata_bytes_from_fastboot() asks the tablet itself with
+          # `fastboot getvar partition-size:userdata`; a runner has no tablet attached, so the host reads that value
+          # and passes it as the userdata_bytes input. Nothing device-specific is committed: partition sizes differ
+          # per board, and the constant this workflow used until run #4 (114521276416) was larger than the live
+          # partition on this tablet (fastboot reports partition-size:userdata 0x14651E0000 = 86991831040).
           mkdir -p build/userdata-root
           cp device/userdata-root.json build/userdata-root/userdata-root.json
           python3 - <<'PY'
@@ -179,8 +190,11 @@ jobs:
           path.write_text(src)
           PY
           git --no-pager diff --stat scripts/seed-data-grow.py
+          USERDATA='${{ inputs.userdata_bytes }}'
+          [ -n "$USERDATA" ] || { echo "grow=true needs the userdata_bytes input (fastboot getvar partition-size:userdata)"; exit 1; }
+          echo "grow: sizing from partition-size:userdata = $USERDATA"
           python3 scripts/seed-data-grow.py --auto \
-            --userdata-bytes "$(python3 -c "import json,sys; print(json.load(open('device/userdata-root.json'))['userdata_bytes'])")" \
+            --userdata-bytes "$USERDATA" \
             "$RUNNER_TEMP/data-32.dbr" "$RUNNER_TEMP/data-grow.dbr"
 
       - name: Mark Setup as done
@@ -190,6 +204,26 @@ jobs:
         run: |
           base="$RUNNER_TEMP/data-grow.dbr"
           [ -f "$base" ] || base="$RUNNER_TEMP/data-32.dbr"
+          # Run #4 (2026-10-28) died here with exit 137 after 21 minutes: scripts/seed-data-skip-setup.py:89 checks
+          # the APFS magic with raw.read_bytes()[32:36], which materialises the *whole* expanded image, so a grown
+          # seed bigger than the runner's RAM is killed while the container is already mounted and edited. Reading
+          # the same 4 bytes at offset 32 is the identical assertion; every other step (expand, hdiutil attach,
+          # merge_pref, detach, packed_ramdisk.pack) is untouched.
+          python3 - <<'PY'
+          import sys
+          from pathlib import Path
+          path = Path('scripts/seed-data-skip-setup.py')
+          src = path.read_text()
+          old = "        if raw.read_bytes()[32:36] != b'NXSB':"
+          new = ("        with raw.open('rb') as probe:\n"
+                 "            probe.seek(32)\n"
+                 "            magic = probe.read(4)\n"
+                 "        if magic != b'NXSB':")
+          if src.count(old) != 1:
+              sys.exit('anchor appears ' + str(src.count(old)) + ' times: ' + old)
+          path.write_text(src.replace(old, new))
+          PY
+          git --no-pager diff --stat scripts/seed-data-skip-setup.py
           args=()
           if [ "$NO_AUTO_DIM" = true ]; then args+=(--no-auto-dim); fi
           python3 scripts/seed-data-skip-setup.py "$base" "$RUNNER_TEMP/data-final.dbr" "${args[@]}"
