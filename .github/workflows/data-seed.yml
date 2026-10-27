@@ -1,0 +1,210 @@
+name: Data seed (macOS)
+
+# Produces the official writable-Data seed that the Linux host cannot make: scripts/prepare-owner-data-fixture.py
+# formats an APFS container with hdiutil and reads it back with diskutil, both macOS-only. Everything here is the
+# upstream command sequence (docs/guide/userdata.md, docs/guide/skip-setup.md, .github/workflows/macos.yml); the
+# only deviation from upstream policy is that the finished seed is uploaded as an artifact, so a Linux porter can
+# flash it. Upstream uploads text logs only ("they derive from Apple software"), so this repository is private and
+# the artifact lives one day.
+
+on:
+  workflow_dispatch:
+    inputs:
+      unixnu_repository:
+        description: UniXNU repository as owner/name
+        required: true
+        default: UniXNU/UniXNU
+      unixnu_ref:
+        description: UniXNU ref to build the seed with
+        required: true
+        default: main
+      grow:
+        description: Grow the seed to the tablet's userdata size (scripts/seed-data-grow.py --auto)
+        type: boolean
+        default: true
+      skip_setup:
+        description: Mark Setup as done in the seed (scripts/seed-data-skip-setup.py)
+        type: boolean
+        default: true
+      no_auto_dim:
+        description: Also disable auto-dim and idle sleep in the seed (the tablet has no input driver yet)
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: data-seed-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  HOMEBREW_NO_AUTO_UPDATE: 1
+  HOMEBREW_NO_INSTALL_CLEANUP: 1
+  HOMEBREW_NO_ENV_HINTS: 1
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  seed:
+    # Same image the official macOS build workflow pins; macos-latest moves between images.
+    runs-on: macos-26
+    timeout-minutes: 240
+    env:
+      UNIXNU_DEVICE: ${{ github.workspace }}/device
+
+    steps:
+      - name: Check out UniXNU
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ inputs.unixnu_repository }}
+          ref: ${{ inputs.unixnu_ref }}
+          persist-credentials: false
+
+      - name: Check out the device repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: device
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+
+      - name: Check the inputs
+        run: |
+          [ -f device/board.toml ] || { echo "::error::device/board.toml not found"; exit 1; }
+          [ -f device/userdata-root.json ] || echo "::warning::device/userdata-root.json missing: grow cannot size the seed from the partition"
+          python3 - <<'PY'
+          import tomllib
+          from pathlib import Path
+          board = tomllib.loads(Path('device/board.toml').read_text())
+          ipsw = board['ipsw']
+          pin = board['ipsw']['sha256']['044-76040-038.dmg']
+          print(f"ipsw product={ipsw['product']} build={ipsw['build']} version={ipsw['version']}")
+          print(f"OS member pin={pin}")
+          PY
+          git --version
+          df -h "$GITHUB_WORKSPACE"
+
+      - name: Fetch the OS volume from the target IPSW
+        run: |
+          # Range-reads the member, never the whole IPSW, and enforces the [ipsw.sha256] pin of the board.
+          ./unixnu ipsw -D "$UNIXNU_DEVICE" fetch OS
+          ls -l out/ipsw/*/
+
+      - name: Attach the OS volume read-only
+        run: |
+          dmg=$(ls "$PWD"/out/ipsw/*/044-76040-038.dmg)
+          mkdir -p .cache/firmware/target-volumes/os-mount
+          hdiutil attach -readonly -nobrowse -mountpoint "$PWD/.cache/firmware/target-volumes/os-mount" "$dmg"
+          # The same assertions scripts/build-owner-os-policy.py:23-38 makes about this attachment.
+          python3 - <<'PY'
+          import hashlib, plistlib, subprocess, sys
+          from pathlib import Path
+          volume = Path('.cache/firmware/target-volumes/os-mount')
+          info = plistlib.loads(subprocess.check_output(['diskutil', 'info', '-plist', str(volume)]))
+          expected = '04769D26-2CA0-4825-B443-E2E5F88300F2'
+          print('VolumeUUID', info['VolumeUUID'], 'Writable', info['Writable'], 'Content', info.get('Content'))
+          if info['VolumeUUID'].upper() != expected:
+              sys.exit(f"the attached volume is {info['VolumeUUID']}, not the original OS volume {expected}")
+          if info['Writable'] is not False:
+              sys.exit('the OS volume must be attached read-only')
+          launchd = volume / 'sbin/launchd'
+          # The gate scripts/prepare-owner-data-fixture.py:22 applies itself; checking it here names the cause.
+          digest = hashlib.sha256(launchd.read_bytes()).hexdigest()
+          pin = '8cec9a3c44a443b08e977ccc5d577850316ad428c575dc01f09b018dbd5b6a25'
+          print('sbin/launchd', launchd.stat().st_size, 'bytes', digest)
+          if digest != pin:
+              sys.exit(f'sbin/launchd is {digest}, not the unchanged original {pin}')
+          PY
+
+      - name: Create the Data seed
+        run: |
+          # Refuses unless .cache/firmware/target-volumes/os-mount/sbin/launchd is the unchanged original.
+          python3 scripts/prepare-owner-data-fixture.py --output build/owner-data-fixture
+          cat build/owner-data-fixture/seed.json
+
+      - name: Pack the seed into DBRDISK1
+        run: |
+          # seed-data-grow.py and seed-data-skip-setup.py both take a packed base; the fixture output is dense raw APFS.
+          git submodule update --init --depth 1 drivers/DarwinBoot
+          mkdir -p build
+          python3 drivers/DarwinBoot/Test/packed_ramdisk.py \
+            build/owner-data-fixture/owner-data-32.cdr "$RUNNER_TEMP/data-32.dbr"
+
+      - name: Grow the seed to the tablet's storage
+        if: inputs.grow
+        run: |
+          # --auto needs build/userdata-root/userdata-root.json (the root image size) and the partition capacity,
+          # both of which come from our own userdata build report.
+          mkdir -p build/userdata-root
+          cp device/userdata-root.json build/userdata-root/userdata-root.json
+          python3 scripts/seed-data-grow.py --auto \
+            --userdata-bytes "$(python3 -c "import json,sys; print(json.load(open('device/userdata-root.json'))['userdata_bytes'])")" \
+            "$RUNNER_TEMP/data-32.dbr" "$RUNNER_TEMP/data-grow.dbr"
+
+      - name: Mark Setup as done
+        if: inputs.skip_setup
+        env:
+          NO_AUTO_DIM: ${{ inputs.no_auto_dim }}
+        run: |
+          base="$RUNNER_TEMP/data-grow.dbr"
+          [ -f "$base" ] || base="$RUNNER_TEMP/data-32.dbr"
+          args=()
+          if [ "$NO_AUTO_DIM" = true ]; then args+=(--no-auto-dim); fi
+          python3 scripts/seed-data-skip-setup.py "$base" "$RUNNER_TEMP/data-final.dbr" "${args[@]}"
+          cat "$RUNNER_TEMP/data-final.json"
+
+      - name: Report the seeds
+        if: always()
+        run: |
+          for f in "$RUNNER_TEMP"/data-*.dbr; do
+            [ -f "$f" ] || continue
+            printf '%s %s %s\n' "$(basename "$f")" "$(stat -f %z "$f")" "$(shasum -a 256 "$f" | cut -d' ' -f1)"
+          done
+          stat -f '%N %z' build/owner-data-fixture/owner-data-32.cdr
+          shasum -a 256 build/owner-data-fixture/owner-data-32.cdr
+
+      - name: Upload the Data seed
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: unixnu-dby-w09-data-seed-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            build/owner-data-fixture/seed.json
+            build/owner-data-fixture/owner-data-32.cdr
+            ${{ runner.temp }}/data-32.dbr
+            ${{ runner.temp }}/data-grow.dbr
+            ${{ runner.temp }}/data-final.dbr
+            ${{ runner.temp }}/data-final.json
+          if-no-files-found: ignore
+          retention-days: 1
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## Data seed for dby_w09"
+            echo
+            echo '| File | Meaning |'
+            echo '| --- | --- |'
+            echo '| owner-data-32.cdr | dense 32 MiB raw APFS container (board: packed_data_ramdisk = false) |'
+            echo '| data-32.dbr | the same container as DBRDISK1 |'
+            echo '| data-grow.dbr | grown to the userdata partition |'
+            echo '| data-final.dbr | grown and Setup marked done |'
+            echo
+            echo '`build/owner-data-fixture/seed.json` carries the volume UUID the kernel needs in'
+            echo 'CONFIG_XNU_OWNER_DATA_VOLUME_UUID (build-xnu-4k-baseline.sh:499-514).'
+            echo 'Artifact retention is 1 day. No Apple image is uploaded, only the seed.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove proprietary inputs
+        if: always()
+        run: |
+          # Mirrors the cleanup step of the official macOS build workflow.
+          hdiutil detach "$PWD/.cache/firmware/target-volumes/os-mount" -force || true
+          rm -rf out/ipsw .cache/firmware device/.cache/firmware build/owner-data-fixture
+          rm -f "$RUNNER_TEMP"/data-32.dbr "$RUNNER_TEMP"/data-grow.dbr "$RUNNER_TEMP"/data-final.dbr
