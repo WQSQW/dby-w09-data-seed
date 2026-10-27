@@ -1,0 +1,22 @@
+{
+  "image_bytes": 9382658048,
+  "image_sha256": "fd43ee7035ce185ce4215ac93fdc006fd784a54b3b7442e21457c226cbe03093",
+  "manifest_sha256": "bc908a6cf66491055077798550660f40128bfe6dce2fdc0db56e6af96511208d",
+  "windows": [
+    {
+      "name": "OS",
+      "offset": 1048576,
+      "size": 6077580800,
+      "sha256": "e5634d04a8ac35f024845f583394e0a35deb26a04cb0c00286a8674e25a9a4f2"
+    },
+    {
+      "name": "SystemOS",
+      "offset": 6079643648,
+      "size": 3303014400,
+      "sha256": "b4908cde41d23e6bc05e6af51a2c9eeb00cf0f863a6a18b1600c96a3fd70414f"
+    }
+  ],
+  "userdata_bytes": 114521276416,
+  "flash_command": "fastboot flash userdata /home/wqsqw/unixnu/UniXNU/build/userdata/userdata-root.img",
+  "hardware_tested": false
+}
