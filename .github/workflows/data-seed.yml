@@ -29,6 +29,16 @@ on:
           seed needs no kernel rebuild while a fresh fixture always does. Empty = format a new one.
         type: string
         default: ''
+      qemu_1g:
+        description: >-
+          Also grow the 32 MiB seed to 1 GiB (qemu-xvt/scripts/build-os-root.py:96-131, the official QEMU recipe).
+          Only a seed of up to 2 GiB is writable under QEMU: drivers/NativeRamBlock.cpp:210 marks anything above
+          0x80000000 big and :261 then answers writes with kIOReturnNotReady until attachStore() finds a UFS store,
+          which QEMU has none of -- while scripts/seed-data-grow.py:92 refuses to build anything below 3 GiB.
+          Resizing preserves the volume UUID, so with base_seed set this seed ships as a payload-only change; from a
+          fresh fixture it carries that fixture's new UUID like every other seed this run produces.
+        type: boolean
+        default: false
       grow:
         description: Grow the seed to the size given below (scripts/seed-data-grow.py --gib)
         type: boolean
@@ -201,6 +211,23 @@ jobs:
           python3 drivers/DarwinBoot/Test/packed_ramdisk.py \
             build/owner-data-fixture/owner-data-32.cdr "$RUNNER_TEMP/data-32.dbr"
 
+      - name: Grow the QEMU 1 GiB seed
+        if: inputs.qemu_1g
+        run: |
+          # device/grow-1g.py is this repository's file: the second checkout puts it under device/ while the
+          # workspace root is the UniXNU tree, so packed_ramdisk resolves from drivers/DarwinBoot/Test.
+          [ -f drivers/DarwinBoot/Test/packed_ramdisk.py ] || { echo '::error::drivers/DarwinBoot not initialised'; exit 1; }
+          python3 device/grow-1g.py --base "$RUNNER_TEMP/data-32.dbr" --output "$RUNNER_TEMP/data-1g.dbr"
+          python3 - <<'PY'
+          import os
+          import sys
+          from pathlib import Path
+          sys.path.insert(0, 'drivers/DarwinBoot/Test')
+          import packed_ramdisk
+          # inspect() returns (metadata, the first page); only the metadata is printed.
+          print('1 GiB seed', packed_ramdisk.inspect(Path(os.environ['RUNNER_TEMP']) / 'data-1g.dbr')[0])
+          PY
+
       - name: Grow the seed to the recorded size
         if: inputs.grow
         run: |
@@ -302,6 +329,7 @@ jobs:
             build/owner-data-fixture/seed.json
             build/owner-data-fixture/owner-data-32.cdr
             ${{ runner.temp }}/data-32.dbr
+            ${{ runner.temp }}/data-1g.dbr
             ${{ runner.temp }}/data-grow.dbr
             ${{ runner.temp }}/data-final.dbr
             ${{ runner.temp }}/data-final.json
@@ -318,6 +346,7 @@ jobs:
             echo '| --- | --- |'
             echo '| owner-data-32.cdr | dense 32 MiB raw APFS container (the fixture as Apple-sized) |'
             echo '| data-32.dbr | the same container as DBRDISK1 |'
+            echo '| data-1g.dbr | grown to the official 1 GiB QEMU size: NativeRamBlock writes only seeds up to 2 GiB without a UFS store, and 32 MiB exhausts itself in two minutes |'
             echo '| data-grow.dbr | grown to the userdata partition |'
             echo '| data-final.dbr | grown and Setup marked done; this is the seed the board ships |'
             echo
@@ -344,4 +373,5 @@ jobs:
           # Mirrors the cleanup step of the official macOS build workflow.
           hdiutil detach "$PWD/.cache/firmware/target-volumes/os-mount" -force || true
           rm -rf out/ipsw .cache/firmware device/.cache/firmware build/owner-data-fixture
-          rm -f "$RUNNER_TEMP"/data-32.dbr "$RUNNER_TEMP"/data-grow.dbr "$RUNNER_TEMP"/data-final.dbr
+          rm -f "$RUNNER_TEMP"/data-32.dbr "$RUNNER_TEMP"/data-1g.dbr "$RUNNER_TEMP"/data-grow.dbr "$RUNNER_TEMP"/data-final.dbr
+          rm -rf "$RUNNER_TEMP"/grow-1g
