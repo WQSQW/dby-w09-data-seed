@@ -214,10 +214,135 @@ jobs:
       - name: Grow the QEMU 1 GiB seed
         if: inputs.qemu_1g
         run: |
-          # device/grow-1g.py is this repository's file: the second checkout puts it under device/ while the
-          # workspace root is the UniXNU tree, so packed_ramdisk resolves from drivers/DarwinBoot/Test.
+          # The recipe is qemu-xvt/scripts/build-os-root.py:96-131 (step 8 of the official QEMU fixture builder), kept
+          # line for line: sparse 1 GiB raw with the 32 MiB seed at offset 0, hdiutil attach as CRawDiskImage,
+          # diskutil apfs resizeContainer <container> 0 so the container fills the image, the APFS header assertions,
+          # SpringBoard's three no-auto-dim keys written for uid 501 through a second attachment with -owners on, then
+          # packed for DarwinBoot. It is inlined because this token can update existing files but not create new ones
+          # (POST /contents/<new path> -> 404, PUT of an existing path -> 200), and build-os-root.py itself only runs
+          # as the whole macOS fixture build: it wants --ipsw and performs the verified-root, policy and driver builds
+          # before this block. UniXNU's own grower cannot make a seed this small -- scripts/seed-data-grow.py:92
+          # rejects anything below 3 GiB -- while a seed above 2 GiB is unwritable here:
+          # drivers/NativeRamBlock.cpp:210 calls it big and :261 answers writes with kIOReturnNotReady until
+          # attachStore() finds a UFS store, which QEMU has no way to provide. Step 8's own text gives both halves of
+          # that rule: "32 MiB fills up within two minutes of the userland (backboardd then crashes with ENOSPC)" and
+          # "NativeRamBlock keeps a seed of up to 2 GiB in memory and allocates a page on its first write; a larger one
+          # waits for sheng's UFS store before it accepts writes".
+          #
+          # Two mechanical adaptations. The base is the packed data-32.dbr instead of the fixture's owner-data-32.cdr,
+          # expanded with packed_ramdisk.regions() -- the inverse of the pack() that made it, the same pair
+          # scripts/seed-data-skip-setup.py uses -- so the step works after a fresh fixture and on a seed restored from
+          # a previous run, and only the container size changes: docs/guide/userdata.md records that a grown seed
+          # keeps its volume UUID. And if the official PhysicalStores comparison finds no container, every container
+          # and store is printed and the widened match (the container reference equals the attached node, or the
+          # whole-disk prefix of its physical store does) is used; run #3 of 2026-10-28 showed that a hdiutil image
+          # publishes two device nodes, so the comparison as written in scripts/seed-data-grow.py:107-115 can never
+          # match an image.
           [ -f drivers/DarwinBoot/Test/packed_ramdisk.py ] || { echo '::error::drivers/DarwinBoot not initialised'; exit 1; }
-          python3 device/grow-1g.py --base "$RUNNER_TEMP/data-32.dbr" --output "$RUNNER_TEMP/data-1g.dbr"
+          cat > "$RUNNER_TEMP/grow-1g.py" <<'PY'
+          import argparse
+          import os
+          import plistlib
+          import re
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          sys.path.insert(0, 'drivers/DarwinBoot/Test')
+          import packed_ramdisk
+
+          ONE_GIB = 1 << 30
+          TOLERANCE = 64 << 20
+
+          parser = argparse.ArgumentParser()
+          parser.add_argument('--base', type=Path, required=True)
+          parser.add_argument('--output', type=Path, required=True)
+          parser.add_argument('--work', type=Path)
+          args = parser.parse_args()
+          work = args.work or Path(os.environ['RUNNER_TEMP']) / 'grow-1g'
+          work.mkdir(parents=True, exist_ok=True)
+
+
+          def check(*command):
+              result = subprocess.run([str(part) for part in command], capture_output=True, text=True)
+              if result.returncode:
+                  sys.exit(f'{command} failed {result.returncode} out={result.stdout} err={result.stderr}')
+              return result.stdout
+
+
+          def attach(image, *extra):
+              return plistlib.loads(subprocess.check_output(
+                  ['hdiutil', 'attach', '-imagekey', 'diskimage-class=CRawDiskImage', *extra, '-plist', str(image)]))
+
+
+          logical, extents = packed_ramdisk.regions(args.base.read_bytes())
+          if logical > ONE_GIB:
+              sys.exit(f'{args.base} holds a {logical} byte container; growing it to 1 GiB would shrink it')
+          fixture = work / 'owner-data-32.cdr'
+          with fixture.open('wb') as handle:
+              handle.truncate(logical)
+              for offset, data in extents:
+                  handle.seek(offset)
+                  handle.write(data)
+          print(f'expanded {args.base} to {fixture} ({logical} bytes, {len(extents)} extents)', flush=True)
+
+          raw = work / 'owner-data-1g.raw'
+          with raw.open('wb') as handle:                 # sparse: only the 32 MiB seed is written
+              handle.truncate(ONE_GIB)
+              handle.seek(0)
+              handle.write(fixture.read_bytes())
+          try:
+              attached = attach(raw, '-nomount', '-nobrowse')
+              store = Path(attached['system-entities'][0]['dev-entry']).name
+              try:
+                  listing = plistlib.loads(subprocess.check_output(['diskutil', 'apfs', 'list', '-plist']))
+                  for entry in listing['Containers']:
+                      for physical in entry.get('PhysicalStores', []):
+                          print('grow-1g: container', entry['ContainerReference'], 'store',
+                                physical['DeviceIdentifier'], 'size', physical.get('Size'), flush=True)
+                  try:
+                      container = next(entry['ContainerReference'] for entry in listing['Containers']
+                                       if any(s['DeviceIdentifier'] == store
+                                              for s in entry.get('PhysicalStores', [])))
+                  except StopIteration:
+                      container = next(entry['ContainerReference'] for entry in listing['Containers']
+                                       if any(entry['ContainerReference'] == store
+                                              or re.match(r'disk\d+', s['DeviceIdentifier']).group(0) == store
+                                              for s in entry.get('PhysicalStores', [])))
+                  print(f'grow-1g: attached {store}, resizing container {container}', flush=True)
+                  print('grow-1g: resized', check('diskutil', 'apfs', 'resizeContainer', container, '0'), flush=True)
+              finally:
+                  subprocess.run(['hdiutil', 'detach', store, '-force'], check=True)
+
+              header = raw.open('rb').read(4096)
+              blocks = int.from_bytes(header[40:48], 'little')
+              if header[32:36] != b'NXSB' or not ONE_GIB - TOLERANCE <= blocks * 4096 <= ONE_GIB:
+                  raise SystemExit('The grown Data seed is not a 1 GiB APFS container')
+              print(f'grow-1g: {blocks} blocks of 4096 = {blocks * 4096} bytes', flush=True)
+
+              # The seed's files belong to uid 501, which is mobile on iPadOS, the user SpringBoard and its
+              # cfprefsd run as. Without these keys the display sleeps half a minute after the welcome screen and
+              # ArmCpu cannot service the sleep on a board with no input driver.
+              mount = work / 'mount'
+              mount.mkdir(parents=True, exist_ok=True)
+              attached = attach(raw, '-nobrowse', '-owners', 'on', '-mountpoint', mount)
+              try:
+                  preferences = mount / 'mobile/Library/Preferences/com.apple.springboard.plist'
+                  values = plistlib.loads(preferences.read_bytes()) if preferences.exists() else {}
+                  values.update(SBDisableAutoDim=True, SBDontDimOrLockOnAC=True, SBDisableIdleSleep=True)
+                  preferences.write_bytes(plistlib.dumps(values, fmt=plistlib.FMT_BINARY))
+                  preferences.chmod(0o600)
+                  if preferences.stat().st_uid != 501:
+                      raise SystemExit(f'{preferences} does not belong to uid 501 (mobile)')
+              finally:
+                  subprocess.run(['hdiutil', 'detach', attached['system-entities'][0]['dev-entry']], check=True)
+
+              print(check('python3', 'drivers/DarwinBoot/Test/packed_ramdisk.py', raw, args.output), flush=True)
+              print(f'grew {args.base} into {args.output}', flush=True)
+          finally:
+              raw.unlink(missing_ok=True)
+          PY
+          python3 "$RUNNER_TEMP/grow-1g.py" --base "$RUNNER_TEMP/data-32.dbr" --output "$RUNNER_TEMP/data-1g.dbr"
           python3 - <<'PY'
           import os
           import sys
