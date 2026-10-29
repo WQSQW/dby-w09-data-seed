@@ -47,6 +47,14 @@ on:
         description: Mark Setup as done in the seed (scripts/seed-data-skip-setup.py)
         type: boolean
         default: true
+      skip_setup_target:
+        description: >-
+          Which seed in this run's scratch directory Setup is marked done in, by file name (default: data-grow.dbr,
+          else data-32.dbr). Set it to data-1g.dbr to ship a Setup-done QEMU seed: docs/guide/skip-setup.md:34 wants
+          the container grown first, and the 1 GiB seed is the form QEMU's NativeRamBlock can both write to and fit
+          in memory. Left empty, this run's device seed is unaffected.
+        type: string
+        default: ''
       no_auto_dim:
         description: Also disable auto-dim and idle sleep in the seed (the tablet has no input driver yet)
         type: boolean
@@ -408,8 +416,15 @@ jobs:
         env:
           NO_AUTO_DIM: ${{ inputs.no_auto_dim }}
         run: |
-          base="$RUNNER_TEMP/data-grow.dbr"
-          [ -f "$base" ] || base="$RUNNER_TEMP/data-32.dbr"
+          want='${{ inputs.skip_setup_target }}'
+          if [ -n "$want" ]; then
+            base="$RUNNER_TEMP/$want"
+            [ -f "$base" ] || { echo "::error::$want is not in \$RUNNER_TEMP: this run did not produce it"; exit 1; }
+          else
+            base="$RUNNER_TEMP/data-grow.dbr"
+            [ -f "$base" ] || base="$RUNNER_TEMP/data-32.dbr"
+          fi
+          echo "Setup is marked done in $base"
           # Run #4 (2026-10-28) died here with exit 137 after 21 minutes: scripts/seed-data-skip-setup.py:89 checks
           # the APFS magic with raw.read_bytes()[32:36], which materialises the *whole* expanded image, so a grown
           # seed bigger than the runner's RAM is killed while the container is already mounted and edited. Reading
