@@ -29,16 +29,28 @@ on:
           seed needs no kernel rebuild while a fresh fixture always does. Empty = format a new one.
         type: string
         default: ''
-      qemu_1g:
+      qemu_seed:
         description: >-
-          Also grow the 32 MiB seed to 1 GiB (qemu-xvt/scripts/build-os-root.py:96-131, the official QEMU recipe).
-          Only a seed of up to 2 GiB is writable under QEMU: drivers/NativeRamBlock.cpp:210 marks anything above
-          0x80000000 big and :261 then answers writes with kIOReturnNotReady until attachStore() finds a UFS store,
-          which QEMU has none of -- while scripts/seed-data-grow.py:92 refuses to build anything below 3 GiB.
-          Resizing preserves the volume UUID, so with base_seed set this seed ships as a payload-only change; from a
-          fresh fixture it carries that fixture's new UUID like every other seed this run produces.
+          Also grow the 32 MiB seed to the QEMU size given below (recipe: qemu-xvt/scripts/build-os-root.py:96-131,
+          step 8 of the official QEMU fixture builder, which uses 1 GiB). Two ceilings bound that size. Only a seed
+          of up to 2 GiB is writable under QEMU: drivers/NativeRamBlock.cpp:210 marks anything above 0x80000000 big
+          and :261 then answers writes with kIOReturnNotReady until attachStore() finds a UFS store, which QEMU has
+          none of -- while scripts/seed-data-grow.py:92 refuses to build anything below 3 GiB. And the sparse path
+          hashes the seed's whole logical size once at attach (NativeRamBlock.cpp:235, 4 KiB per SHA256_Update),
+          which measured 20+ minutes of TCG for 1 GiB on this host and seconds for 32 MiB: the big path above 2 GiB
+          skips that hash by folding only its nonzero extents, which is why the device boots an 8 GiB seed happily
+          and QEMU does not. Resizing preserves the volume UUID, so with base_seed set this seed ships as a
+          payload-only change; from a fresh fixture it carries that fixture's new UUID like every other seed this
+          run produces.
         type: boolean
         default: false
+      qemu_seed_mib:
+        description: >-
+          MiB to grow the QEMU seed to (qemu_seed). 1024 is what the official fixture uses; 128 costs an eighth of
+          its attach-time hash while still leaving ~24500 free blocks, against the 223 that made the 32 MiB seed
+          report ENOSPC every transaction.
+        type: string
+        default: '1024'
       grow:
         description: Grow the seed to the size given below (scripts/seed-data-grow.py --gib)
         type: boolean
@@ -50,7 +62,7 @@ on:
       skip_setup_target:
         description: >-
           Which seed in this run's scratch directory Setup is marked done in, by file name (default: data-grow.dbr,
-          else data-32.dbr). Set it to data-1g.dbr to ship a Setup-done QEMU seed: docs/guide/skip-setup.md:34 wants
+          else data-32.dbr). Set it to data-qemu.dbr to ship a Setup-done QEMU seed: docs/guide/skip-setup.md:34 wants
           the container grown first, and the 1 GiB seed is the form QEMU's NativeRamBlock can both write to and fit
           in memory. Left empty, this run's device seed is unaffected.
         type: string
@@ -219,9 +231,10 @@ jobs:
           python3 drivers/DarwinBoot/Test/packed_ramdisk.py \
             build/owner-data-fixture/owner-data-32.cdr "$RUNNER_TEMP/data-32.dbr"
 
-      - name: Grow the QEMU 1 GiB seed
-        if: inputs.qemu_1g
+      - name: Grow the QEMU seed
+        if: inputs.qemu_seed
         run: |
+          case '${{ inputs.qemu_seed_mib }}' in ''|*[!0-9]*) echo "qemu_seed_mib must be a whole number of MiB"; exit 1;; esac
           # The recipe is qemu-xvt/scripts/build-os-root.py:96-131 (step 8 of the official QEMU fixture builder), kept
           # line for line: sparse 1 GiB raw with the 32 MiB seed at offset 0, hdiutil attach as CRawDiskImage,
           # diskutil apfs resizeContainer <container> 0 so the container fills the image, the APFS header assertions,
@@ -247,7 +260,7 @@ jobs:
           # publishes two device nodes, so the comparison as written in scripts/seed-data-grow.py:107-115 can never
           # match an image.
           [ -f drivers/DarwinBoot/Test/packed_ramdisk.py ] || { echo '::error::drivers/DarwinBoot not initialised'; exit 1; }
-          cat > "$RUNNER_TEMP/grow-1g.py" <<'PY'
+          cat > "$RUNNER_TEMP/grow-qemu.py" <<'PY'
           import argparse
           import os
           import plistlib
@@ -259,15 +272,17 @@ jobs:
           sys.path.insert(0, 'drivers/DarwinBoot/Test')
           import packed_ramdisk
 
-          ONE_GIB = 1 << 30
+          GIB = 1 << 30
           TOLERANCE = 64 << 20
 
           parser = argparse.ArgumentParser()
           parser.add_argument('--base', type=Path, required=True)
           parser.add_argument('--output', type=Path, required=True)
+          parser.add_argument('--mib', type=int, required=True)
           parser.add_argument('--work', type=Path)
           args = parser.parse_args()
-          work = args.work or Path(os.environ['RUNNER_TEMP']) / 'grow-1g'
+          target = args.mib << 20
+          work = args.work or Path(os.environ['RUNNER_TEMP']) / 'grow-qemu'
           work.mkdir(parents=True, exist_ok=True)
 
 
@@ -284,8 +299,8 @@ jobs:
 
 
           logical, extents = packed_ramdisk.regions(args.base.read_bytes())
-          if logical > ONE_GIB:
-              sys.exit(f'{args.base} holds a {logical} byte container; growing it to 1 GiB would shrink it')
+          if logical > target:
+              sys.exit(f'{args.base} holds a {logical} byte container; growing it to {args.mib} MiB would shrink it')
           fixture = work / 'owner-data-32.cdr'
           with fixture.open('wb') as handle:
               handle.truncate(logical)
@@ -294,9 +309,9 @@ jobs:
                   handle.write(data)
           print(f'expanded {args.base} to {fixture} ({logical} bytes, {len(extents)} extents)', flush=True)
 
-          raw = work / 'owner-data-1g.raw'
+          raw = work / 'owner-data-qemu.raw'
           with raw.open('wb') as handle:                 # sparse: only the 32 MiB seed is written
-              handle.truncate(ONE_GIB)
+              handle.truncate(target)
               handle.seek(0)
               handle.write(fixture.read_bytes())
           try:
@@ -306,7 +321,7 @@ jobs:
                   listing = plistlib.loads(subprocess.check_output(['diskutil', 'apfs', 'list', '-plist']))
                   for entry in listing['Containers']:
                       for physical in entry.get('PhysicalStores', []):
-                          print('grow-1g: container', entry['ContainerReference'], 'store',
+                          print('grow-qemu: container', entry['ContainerReference'], 'store',
                                 physical['DeviceIdentifier'], 'size', physical.get('Size'), flush=True)
                   try:
                       container = next(entry['ContainerReference'] for entry in listing['Containers']
@@ -317,16 +332,16 @@ jobs:
                                        if any(entry['ContainerReference'] == store
                                               or re.match(r'disk\d+', s['DeviceIdentifier']).group(0) == store
                                               for s in entry.get('PhysicalStores', [])))
-                  print(f'grow-1g: attached {store}, resizing container {container}', flush=True)
-                  print('grow-1g: resized', check('diskutil', 'apfs', 'resizeContainer', container, '0'), flush=True)
+                  print(f'grow-qemu: attached {store}, resizing container {container}', flush=True)
+                  print('grow-qemu: resized', check('diskutil', 'apfs', 'resizeContainer', container, '0'), flush=True)
               finally:
                   subprocess.run(['hdiutil', 'detach', store, '-force'], check=True)
 
               header = raw.open('rb').read(4096)
               blocks = int.from_bytes(header[40:48], 'little')
-              if header[32:36] != b'NXSB' or not ONE_GIB - TOLERANCE <= blocks * 4096 <= ONE_GIB:
-                  raise SystemExit('The grown Data seed is not a 1 GiB APFS container')
-              print(f'grow-1g: {blocks} blocks of 4096 = {blocks * 4096} bytes', flush=True)
+              if header[32:36] != b'NXSB' or not target - TOLERANCE <= blocks * 4096 <= target:
+                  raise SystemExit(f'The grown Data seed is not a {args.mib} MiB APFS container')
+              print(f'grow-qemu: {blocks} blocks of 4096 = {blocks * 4096} bytes', flush=True)
 
               # The seed's files belong to uid 501, which is mobile on iPadOS, the user SpringBoard and its
               # cfprefsd run as. Without these keys the display sleeps half a minute after the welcome screen and
@@ -350,7 +365,8 @@ jobs:
           finally:
               raw.unlink(missing_ok=True)
           PY
-          python3 "$RUNNER_TEMP/grow-1g.py" --base "$RUNNER_TEMP/data-32.dbr" --output "$RUNNER_TEMP/data-1g.dbr"
+          python3 "$RUNNER_TEMP/grow-qemu.py" --base "$RUNNER_TEMP/data-32.dbr" --mib '${{ inputs.qemu_seed_mib }}' \
+            --output "$RUNNER_TEMP/data-qemu.dbr"
           python3 - <<'PY'
           import os
           import sys
@@ -358,7 +374,7 @@ jobs:
           sys.path.insert(0, 'drivers/DarwinBoot/Test')
           import packed_ramdisk
           # inspect() returns (metadata, the first page); only the metadata is printed.
-          print('1 GiB seed', packed_ramdisk.inspect(Path(os.environ['RUNNER_TEMP']) / 'data-1g.dbr')[0])
+          print('QEMU seed', packed_ramdisk.inspect(Path(os.environ['RUNNER_TEMP']) / 'data-qemu.dbr')[0])
           PY
 
       - name: Grow the seed to the recorded size
@@ -474,7 +490,7 @@ jobs:
             build/owner-data-fixture/seed.json
             build/owner-data-fixture/owner-data-32.cdr
             ${{ runner.temp }}/data-32.dbr
-            ${{ runner.temp }}/data-1g.dbr
+            ${{ runner.temp }}/data-qemu.dbr
             ${{ runner.temp }}/data-grow.dbr
             ${{ runner.temp }}/data-final.dbr
             ${{ runner.temp }}/data-final.json
@@ -491,7 +507,7 @@ jobs:
             echo '| --- | --- |'
             echo '| owner-data-32.cdr | dense 32 MiB raw APFS container (the fixture as Apple-sized) |'
             echo '| data-32.dbr | the same container as DBRDISK1 |'
-            echo '| data-1g.dbr | grown to the official 1 GiB QEMU size: NativeRamBlock writes only seeds up to 2 GiB without a UFS store, and 32 MiB exhausts itself in two minutes |'
+            echo '| data-qemu.dbr | grown to qemu_seed_mib for the QEMU fixture: NativeRamBlock writes only seeds up to 2 GiB without a UFS store, 32 MiB exhausts itself in two minutes, and its attach-time hash costs one SHA256_Update per 4 KiB of logical size |'
             echo '| data-grow.dbr | grown to the userdata partition |'
             echo '| data-final.dbr | grown and Setup marked done; this is the seed the board ships |'
             echo
@@ -518,5 +534,5 @@ jobs:
           # Mirrors the cleanup step of the official macOS build workflow.
           hdiutil detach "$PWD/.cache/firmware/target-volumes/os-mount" -force || true
           rm -rf out/ipsw .cache/firmware device/.cache/firmware build/owner-data-fixture
-          rm -f "$RUNNER_TEMP"/data-32.dbr "$RUNNER_TEMP"/data-1g.dbr "$RUNNER_TEMP"/data-grow.dbr "$RUNNER_TEMP"/data-final.dbr
-          rm -rf "$RUNNER_TEMP"/grow-1g
+          rm -f "$RUNNER_TEMP"/data-32.dbr "$RUNNER_TEMP"/data-qemu.dbr "$RUNNER_TEMP"/data-grow.dbr "$RUNNER_TEMP"/data-final.dbr
+          rm -rf "$RUNNER_TEMP"/grow-qemu
