@@ -170,8 +170,8 @@ jobs:
           done
           [ -n "$base" ] || { echo "::error::no data-32.dbr/data-qemu.dbr/data-final.dbr in the artifact of run ${{ inputs.base_seed }}"; exit 1; }
           echo "growing $base"
-          # Grow the pre-Setup container so the documented order holds (docs/guide/skip-setup.md:34: grow first,
-          # then the payload edits the grown seed and keeps its size).
+          # docs/guide/skip-setup.md:34 wants the container grown before Setup is marked, so a base that is already
+          # Setup-done (data-final.dbr) ships as skip_setup=false; a pre-Setup base still gets the documented order.
           cp "$base" "$RUNNER_TEMP/data-32.dbr"
           stat -f '%z %N' "$RUNNER_TEMP/data-32.dbr"
           shasum -a 256 "$RUNNER_TEMP/data-32.dbr"
@@ -187,7 +187,15 @@ jobs:
           print('base seed', packed_ramdisk.inspect(Path(os.environ['RUNNER_TEMP']) / 'data-32.dbr')[0])
           PY
           json=$(find base-seed -name seed.json -print -quit)
-          [ -n "$json" ] && { echo 'the volume UUID this run keeps:'; grep volume_uuid "$json"; }
+          # A run that only grew seeds records no fixture seed.json (run #12 died here: under bash -e a trailing
+          # [ -n "$json" ] && ... is a failing final command). Growth leaves the volume UUID alone
+          # (docs/guide/userdata.md), so the kernel's CONFIG_XNU_OWNER_DATA_VOLUME_UUID pin still holds.
+          if [ -n "$json" ]; then
+            echo 'the volume UUID this run keeps:'
+            grep volume_uuid "$json"
+          else
+            echo 'no seed.json in the base artifact: this run inherits the base seed UUID'
+          fi
 
       - name: Fetch the OS volume from the target IPSW
         if: inputs.base_seed == ''
