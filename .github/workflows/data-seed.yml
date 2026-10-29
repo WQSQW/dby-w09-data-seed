@@ -425,6 +425,11 @@ jobs:
             [ -f "$base" ] || base="$RUNNER_TEMP/data-32.dbr"
           fi
           echo "Setup is marked done in $base"
+          # Run #8 (2026-10-29) died here with FileNotFoundError: .../dby-w09-data-seed/build/data-seed-qoy5nw8y.
+          # scripts/seed-data-skip-setup.py:49 makes its scratch dir with tempfile.TemporaryDirectory(dir=ROOT/'build'),
+          # and in base_seed mode no earlier step (fetch/attach/fixture/pack) ever creates build/. The directory is
+          # the script's own declared scratch parent, so creating it is the whole fix.
+          mkdir -p build
           # Run #4 (2026-10-28) died here with exit 137 after 21 minutes: scripts/seed-data-skip-setup.py:89 checks
           # the APFS magic with raw.read_bytes()[32:36], which materialises the *whole* expanded image, so a grown
           # seed bigger than the runner's RAM is killed while the container is already mounted and edited. Reading
