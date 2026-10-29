@@ -160,8 +160,16 @@ jobs:
           # drivers/DarwinBoot/Test/packed_ramdisk.py is used by the grow and skip-setup steps; it is a submodule
           # and the "Pack the seed" step that normally initialises it is skipped in this mode.
           git submodule update --init --depth 1 drivers/DarwinBoot
-          base=$(find base-seed -name data-32.dbr -print -quit)
-          [ -n "$base" ] || { echo "::error::no data-32.dbr in the artifact of run ${{ inputs.base_seed }}"; exit 1; }
+          # Any recorded packed seed is a valid base: growth preserves the volume UUID (docs/guide/userdata.md), so
+          # a 32 MiB fixture, a QEMU-sized seed and a Setup-done seed are all growable. Run #11 of 2026-10-29 named a
+          # base whose artifact held only data-qemu.dbr/data-final.dbr, which this step then rejected by name.
+          base=
+          for name in data-final.dbr data-qemu.dbr data-32.dbr; do
+            base=$(find base-seed -name "$name" -print -quit)
+            [ -n "$base" ] && break
+          done
+          [ -n "$base" ] || { echo "::error::no data-32.dbr/data-qemu.dbr/data-final.dbr in the artifact of run ${{ inputs.base_seed }}"; exit 1; }
+          echo "growing $base"
           # Grow the pre-Setup container so the documented order holds (docs/guide/skip-setup.md:34: grow first,
           # then the payload edits the grown seed and keeps its size).
           cp "$base" "$RUNNER_TEMP/data-32.dbr"
