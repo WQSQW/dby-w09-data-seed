@@ -565,7 +565,8 @@ jobs:
           cat "$RUNNER_TEMP/sheng-audio-hal/trust.json"
           # The two files the addon carries, and nothing else: mount4 checks ShengAudio.driver/Info.plist by its own
           # path (kern_exec.c:7646), so the bundle layout the builder writes is already the layout the kernel expects.
-          find "$RUNNER_TEMP/sheng-audio-hal" -type f -printf '%s %p\n' | sort -k2
+          stat -f '%z %N' "$RUNNER_TEMP/sheng-audio-hal/ShengAudio.driver/Info.plist" \
+            "$RUNNER_TEMP/sheng-audio-hal/ShengAudio.driver/ShengAudio" "$RUNNER_TEMP/sheng-audio-hal/trust.json"
 
       - name: Report the seeds
         if: always()
