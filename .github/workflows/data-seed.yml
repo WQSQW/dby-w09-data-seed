@@ -71,6 +71,43 @@ on:
         description: Also disable auto-dim and idle sleep in the seed (the tablet has no input driver yet)
         type: boolean
         default: true
+      sheng_repository:
+        description: >-
+          Donor-board repository that carries the audio server plug-in, as owner/name. hal/ShengAudioPlugIn.c is the
+          CoreAudio HAL the audio server loads, package/ShengAudioAbi.h is the shared-ring ABI the kernel service
+          speaks, and scripts/build-sheng-audio-hal.py builds the bundle. The public head of this repository was
+          checked against package/ShengAudioAbi.h on 2026-11-07 and is byte-identical to the ABI this board's kernel
+          half uses (sha256 9ef369877cfae3d2255129f7fdf332448b71300a0fc840d6522ec83e09754b52), so the plug-in and the
+          service cannot disagree about the control page; its only extra over our older snapshot is arm64e pointer
+          authentication for iPadOS 27's server, which an arm64-apple-ios17.0 build compiles out.
+        required: true
+        default: UniXNU/UniXNU-sheng
+      sheng_commit:
+        description: >-
+          Commit of the plug-in source. Pinned, not a branch: the CDHash that goes into the owner trust cache is a
+          property of the exact bytes that were compiled, so a moving branch silently changes the signature and the
+          next payload rejects a plug-in that still looks like the same file.
+        required: true
+        default: 689400177f93219a38bd7cf5ae2e9f5782adc594
+      audio_hal:
+        description: >-
+          Build the CoreAudio server plug-in and upload the bundle with its CDHash. Without a HAL in
+          /System/Library/Audio/Plug-Ins/HAL the audio server has no IOAudio2 device and the volume slider has
+          nothing to talk to; the bundle gets there through the payload addon, which the kernel union-mounts over
+          that directory (boot arg sheng-gpu-addon=1, kern_exec.c:7646 native_gpu_addon_prepare(), the 0xa00 entry),
+          and its CDHash has to enter the owner trust cache because the signature is ad hoc.
+        type: boolean
+        default: true
+      audio_only:
+        description: >-
+          Build only the plug-in: format no fixture, fetch no IPSW member, attach no Apple volume, grow and edit no
+          seed. This is the input this delivery uses, because the official text says the audio update travels in the
+          addon and does not edit the Data seed (docs/porting/packaging.md:136-137, docs/zh/devices/sheng.md:519), and
+          the board's existing seed keeps working: the addon mount writes under /private/var/ngpu/audio at boot and
+          leaves the volume UUID alone, so the kernel's CONFIG_XNU_OWNER_DATA_VOLUME_UUID pin still holds and nothing
+          costs a kernel rebuild. A run with this input set produces no Apple-derived bytes at all.
+        type: boolean
+        default: false
       grow_gib:
         description: >-
           GiB to grow the seed to (scripts/seed-data-grow.py --gib N; docs/guide/userdata.md:63 uses 8). It is a
@@ -119,6 +156,15 @@ jobs:
           path: device
           persist-credentials: false
 
+      - name: Check out the plug-in source
+        if: inputs.audio_hal
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ inputs.sheng_repository }}
+          ref: ${{ inputs.sheng_commit }}
+          path: kit
+          persist-credentials: false
+
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.13"
@@ -127,6 +173,22 @@ jobs:
         run: |
           [ -f device/board.toml ] || { echo "::error::device/board.toml not found"; exit 1; }
           [ -f device/userdata-root.json ] || echo "::warning::device/userdata-root.json missing: grow cannot size the seed from the partition"
+          if [ '${{ inputs.audio_hal }}' = true ]; then
+            stat -f '%z %N' kit/hal/ShengAudioPlugIn.c kit/hal/Info.plist kit/package/ShengAudioAbi.h \
+              kit/scripts/build-sheng-audio-hal.py
+            plutil -p kit/hal/Info.plist
+            # The gate, not a printout. The plug-in is compiled from the donor tree and records its own CDHash, so
+            # bundle and trust entry cannot come apart; what is not automatic is the ABI. The board kernel compiles
+            # package/ShengAudioService.cpp against the device repository's copy of ShengAudioAbi.h, and the
+            # plug-in is compiled against this copy, so the control page and the two sample rings are the same
+            # struct only while the two files are the same bytes. 9ef36987... is the device repository's digest.
+            shasum -a 256 kit/hal/ShengAudioPlugIn.c kit/hal/Info.plist kit/package/ShengAudioAbi.h
+            abi=$(shasum -a 256 kit/package/ShengAudioAbi.h | cut -d' ' -f1)
+            if [ "$abi" != 9ef369877cfae3d2255129f7fdf332448b71300a0fc840d6522ec83e09754b52 ]; then
+              echo "::error::kit/package/ShengAudioAbi.h is $abi, not the 9ef369877cfae3d2255129f7fdf332448b71300a0fc840d6522ec83e09754b52 the board kernel uses: the plug-in would read the shared rings at the wrong offsets"
+              exit 1
+            fi
+          fi
           python3 - <<'PY'
           import tomllib
           from pathlib import Path
@@ -140,14 +202,14 @@ jobs:
           df -h "$GITHUB_WORKSPACE"
 
       - name: Restore the seed recorded by a previous run
-        if: inputs.base_seed != ''
+        if: inputs.base_seed != '' && !inputs.audio_only
         run: |
           # The base seed is fetched from our own previous artifact rather than committed: it contains the original
           # private/var files copied out of the Apple OS volume, so it must not enter the repository tree.
           echo "growing the data-32.dbr published by run ${{ inputs.base_seed }}"
 
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        if: inputs.base_seed != ''
+        if: inputs.base_seed != '' && !inputs.audio_only
         with:
           name: unixnu-dby-w09-data-seed-${{ inputs.base_seed }}-1
           run-id: ${{ inputs.base_seed }}
@@ -155,7 +217,7 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Select the base seed
-        if: inputs.base_seed != ''
+        if: inputs.base_seed != '' && !inputs.audio_only
         run: |
           # drivers/DarwinBoot/Test/packed_ramdisk.py is used by the grow and skip-setup steps; it is a submodule
           # and the "Pack the seed" step that normally initialises it is skipped in this mode.
@@ -198,14 +260,14 @@ jobs:
           fi
 
       - name: Fetch the OS volume from the target IPSW
-        if: inputs.base_seed == ''
+        if: inputs.base_seed == '' && !inputs.audio_only
         run: |
           # Range-reads the member, never the whole IPSW, and enforces the [ipsw.sha256] pin of the board.
           ./unixnu ipsw -D "$UNIXNU_DEVICE" fetch OS
           ls -l out/ipsw/*/
 
       - name: Attach the OS volume read-only
-        if: inputs.base_seed == ''
+        if: inputs.base_seed == '' && !inputs.audio_only
         run: |
           dmg=$(ls "$PWD"/out/ipsw/*/044-76040-038.dmg)
           mkdir -p .cache/firmware/target-volumes/os-mount
@@ -232,14 +294,14 @@ jobs:
           PY
 
       - name: Create the Data seed
-        if: inputs.base_seed == ''
+        if: inputs.base_seed == '' && !inputs.audio_only
         run: |
           # Refuses unless .cache/firmware/target-volumes/os-mount/sbin/launchd is the unchanged original.
           python3 scripts/prepare-owner-data-fixture.py --output build/owner-data-fixture
           cat build/owner-data-fixture/seed.json
 
       - name: Pack the seed into DBRDISK1
-        if: inputs.base_seed == ''
+        if: inputs.base_seed == '' && !inputs.audio_only
         run: |
           # seed-data-grow.py and seed-data-skip-setup.py both take a packed base; the fixture output is dense raw APFS.
           git submodule update --init --depth 1 drivers/DarwinBoot
@@ -248,7 +310,7 @@ jobs:
             build/owner-data-fixture/owner-data-32.cdr "$RUNNER_TEMP/data-32.dbr"
 
       - name: Grow the QEMU seed
-        if: inputs.qemu_seed
+        if: inputs.qemu_seed && !inputs.audio_only
         run: |
           case '${{ inputs.qemu_seed_mib }}' in ''|*[!0-9]*) echo "qemu_seed_mib must be a whole number of MiB"; exit 1;; esac
           # The recipe is qemu-xvt/scripts/build-os-root.py:96-131 (step 8 of the official QEMU fixture builder), kept
@@ -394,7 +456,7 @@ jobs:
           PY
 
       - name: Grow the seed to the recorded size
-        if: inputs.grow
+        if: inputs.grow && !inputs.audio_only
         run: |
           case '${{ inputs.grow_gib }}' in ''|*[!0-9]*) echo "grow_gib must be a whole number of GiB"; exit 1;; esac
           # docs/guide/userdata.md:60-75 is the official sizing instruction: `--gib N` (its own example is 8) and
@@ -444,7 +506,7 @@ jobs:
             "$RUNNER_TEMP/data-32.dbr" "$RUNNER_TEMP/data-grow.dbr"
 
       - name: Mark Setup as done
-        if: inputs.skip_setup
+        if: inputs.skip_setup && !inputs.audio_only
         env:
           NO_AUTO_DIM: ${{ inputs.no_auto_dim }}
         run: |
@@ -487,6 +549,24 @@ jobs:
           python3 scripts/seed-data-skip-setup.py "$base" "$RUNNER_TEMP/data-final.dbr" "${args[@]}"
           cat "$RUNNER_TEMP/data-final.json"
 
+      - name: Build the audio server plug-in
+        if: inputs.audio_hal
+        run: |
+          # The iPhoneOS SDK is the target; the CoreAudio headers come from the macOS SDK because the iOS one ships no
+          # AudioServerPlugIn.h, and the builder symlinks the three it needs into a scratch include directory. The
+          # default target is arm64-apple-ios17.0, which is this donor's audio server; the builder also accepts
+          # arm64e-apple-ios27.0, and that variant changes the CDHash, so a target change is a trust-cache change.
+          # codesign --pagesize 4096 is what iOS arm64 expects, and the ad hoc signature is why the CDHash has to be
+          # added to the owner trust cache instead of the payload being self-sufficient.
+          xcrun --sdk iphoneos --show-sdk-path
+          xcrun --sdk macosx --show-sdk-path
+          python3 kit/scripts/build-sheng-audio-hal.py "$RUNNER_TEMP/sheng-audio-hal"
+          codesign --display --verbose=4 "$RUNNER_TEMP/sheng-audio-hal/ShengAudio.driver"
+          cat "$RUNNER_TEMP/sheng-audio-hal/trust.json"
+          # The two files the addon carries, and nothing else: mount4 checks ShengAudio.driver/Info.plist by its own
+          # path (kern_exec.c:7646), so the bundle layout the builder writes is already the layout the kernel expects.
+          find "$RUNNER_TEMP/sheng-audio-hal" -type f -printf '%s %p\n' | sort -k2
+
       - name: Report the seeds
         if: always()
         run: |
@@ -513,6 +593,18 @@ jobs:
           if-no-files-found: ignore
           retention-days: 1
 
+      - name: Upload the audio server plug-in
+        if: inputs.audio_hal
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: unixnu-sheng-audio-hal-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/sheng-audio-hal/ShengAudio.driver/Info.plist
+            ${{ runner.temp }}/sheng-audio-hal/ShengAudio.driver/ShengAudio
+            ${{ runner.temp }}/sheng-audio-hal/trust.json
+          if-no-files-found: error
+          retention-days: 1
+
       - name: Summary
         if: always()
         run: |
@@ -526,6 +618,7 @@ jobs:
             echo '| data-qemu.dbr | grown to qemu_seed_mib for the QEMU fixture: NativeRamBlock writes only seeds up to 2 GiB without a UFS store, 32 MiB exhausts itself in two minutes, and its attach-time hash costs one SHA256_Update per 4 KiB of logical size |'
             echo '| data-grow.dbr | grown to the userdata partition |'
             echo '| data-final.dbr | grown and Setup marked done; this is the seed the board ships |'
+            echo '| sheng-audio-hal/ShengAudio.driver | the compiled CoreAudio server plug-in, in its own artifact unixnu-sheng-audio-hal-RUN-ATTEMPT |'
             echo
             echo 'A grown seed is only deliverable packed: [payload.adt] packed_data_ramdisk = true makes the ADT'
             echo 'reserve PackedRAMDisk, DarwinBoot keeps the DBRDISK1 bytes (KeepPacked) and the kernel'
@@ -542,6 +635,19 @@ jobs:
             echo 'its UUID (docs/guide/userdata.md) and can ship as a payload-only change. When base_seed names a'
             echo 'run, no new fixture is formatted and this run inherits that run'"'"'s UUID.'
             echo 'Artifact retention is 1 day. No Apple image is uploaded, only the seed.'
+
+            echo
+            echo 'With audio_hal the plug-in'"'"'s CDHash is in `sheng-audio-hal/trust.json` and is a build output, not a'
+            echo 'recorded constant: an untrusted bundle is refused by AMFI before the audio server loads it. The Linux'
+            echo 'half packs it the way the upstream does it for its own board (UniXNU-sheng scripts/pack27-gpu.sh:16,19):'
+            echo '`addon-add-dir.py BASE.bin ADDON.bin audio <stage>` puts the bundle in the NGPUADD2 addon under'
+            echo '`audio/`, and `trust-append-module.py` appends its CDHash to the owner trust bundle, which'
+            echo '`unixnu build payload --gpu-addon ADDON.bin --owner-trust-cache BUNDLE` then ships. The kernel mounts'
+            echo 'the addon'"'"'s audio directory over /System/Library/Audio/Plug-Ins/HAL (kern_exec.c:7646, the 0xa00'
+            echo 'entry, gated by the boot arg sheng-gpu-addon=1) and reports on the BootProgress A line as'
+            echo '`mount4=stage/status`. With audio_only no seed is produced, which is deliberate:'
+            echo 'docs/porting/packaging.md:136-137 states that GPU and audio updates travel in the addon and do not'
+            echo 'edit the Data seed, so the board'"'"'s existing seed keeps its volume UUID and no kernel rebuild.'
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Remove proprietary inputs
@@ -551,4 +657,5 @@ jobs:
           hdiutil detach "$PWD/.cache/firmware/target-volumes/os-mount" -force || true
           rm -rf out/ipsw .cache/firmware device/.cache/firmware build/owner-data-fixture
           rm -f "$RUNNER_TEMP"/data-32.dbr "$RUNNER_TEMP"/data-qemu.dbr "$RUNNER_TEMP"/data-grow.dbr "$RUNNER_TEMP"/data-final.dbr
+          rm -rf "$RUNNER_TEMP"/sheng-audio-hal kit
           rm -rf "$RUNNER_TEMP"/grow-qemu
