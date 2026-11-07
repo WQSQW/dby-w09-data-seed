@@ -225,8 +225,11 @@ jobs:
           # Any recorded packed seed is a valid base: growth preserves the volume UUID (docs/guide/userdata.md), so
           # a 32 MiB fixture, a QEMU-sized seed and a Setup-done seed are all growable. Run #11 of 2026-10-29 named a
           # base whose artifact held only data-qemu.dbr/data-final.dbr, which this step then rejected by name.
+          # The order is pre-Setup first, because grow refuses a seed that already holds the target size:
+          # run #18 of 2026-11-08 named run #17 as its base, took the data-final.dbr of that run (already 8 GiB),
+          # and died at "seed already holds 8 GiB; growing needs a larger size".
           base=
-          for name in data-final.dbr data-qemu.dbr data-32.dbr; do
+          for name in data-32.dbr data-qemu.dbr data-final.dbr; do
             base=$(find base-seed -name "$name" -print -quit)
             [ -n "$base" ] && break
           done
