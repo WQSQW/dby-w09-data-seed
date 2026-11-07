@@ -586,8 +586,11 @@ jobs:
           # the volume UUID is unchanged, so over data-final.dbr this seed costs no kernel rebuild.
           # The inlined script resolves ROOT = parents[1] of its own path, so written to
           # $RUNNER_TEMP/stage/ it reads BUNDLE and its scratch dir under $RUNNER_TEMP/build, not
-          # $RUNNER_TEMP/stage/build. Run #16 of 2026-11-08 died here with "Build the plug-in first".
-          mkdir -p "$RUNNER_TEMP/build"
+          # $RUNNER_TEMP/stage/build. Run #16 of 2026-11-08 died with "Build the plug-in first" (the bundle was in
+          # stage/build, which the script never looks at), and run #17 of the same day died one line earlier,
+          # at the heredoc, because that fix dropped the only command that created $RUNNER_TEMP/stage: both
+          # directories are made now.
+          mkdir -p "$RUNNER_TEMP/stage" "$RUNNER_TEMP/build"
           cp -R "$RUNNER_TEMP/sheng-audio-hal" "$RUNNER_TEMP/build/sheng-audio-hal"
           cat >"$RUNNER_TEMP/stage/add-sheng-audio-data.py" <<'PY'
           #!/usr/bin/env python3
