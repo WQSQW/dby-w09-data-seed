@@ -584,8 +584,11 @@ jobs:
           # inlined because the Contents API of this token cannot create a file at a new path (404 at any depth,
           # measured 2026-10-29), which is also how the QEMU recipe entered this workflow. BASE is not modified and
           # the volume UUID is unchanged, so over data-final.dbr this seed costs no kernel rebuild.
-          mkdir -p "$RUNNER_TEMP/stage/build"
-          cp -R "$RUNNER_TEMP/sheng-audio-hal" "$RUNNER_TEMP/stage/build/sheng-audio-hal"
+          # The inlined script resolves ROOT = parents[1] of its own path, so written to
+          # $RUNNER_TEMP/stage/ it reads BUNDLE and its scratch dir under $RUNNER_TEMP/build, not
+          # $RUNNER_TEMP/stage/build. Run #16 of 2026-11-08 died here with "Build the plug-in first".
+          mkdir -p "$RUNNER_TEMP/build"
+          cp -R "$RUNNER_TEMP/sheng-audio-hal" "$RUNNER_TEMP/build/sheng-audio-hal"
           cat >"$RUNNER_TEMP/stage/add-sheng-audio-data.py" <<'PY'
           #!/usr/bin/env python3
           """Stage the owner-built audio server plug-in into a copy of a packed Data seed.
