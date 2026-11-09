@@ -115,6 +115,40 @@ on:
           allocation after root windows, store metadata and log reservations.
         required: true
         default: '8'
+      board_repository:
+        description: >-
+          Repository that carries the board scripts for the MediaCapture plug-in, as owner/name. The audio plug-in is
+          compiled from the donor tree because its source lives there; the MediaCapture bundle is compiled from this
+          board's own repository, where package/DbyTorch/ios and package/DbyCamera/ios are. It is checked out under
+          `board`, beside the `device` directory that already holds this repository's recorded board.toml, so turning
+          the camera on cannot change what any audio step reads.
+        required: true
+        default: WQSQW/UniXNU-dby_w09
+      board_commit:
+        description: >-
+          Commit of that repository, pinned for the same reason as sheng_commit: the CDHash that enters the owner trust
+          cache is a property of the exact bytes that were compiled, and this plug-in is the whole payload of a run.
+        required: true
+        default: 8465f4926a3f95b90089c3ba66b3606029871910
+      camera_plugin:
+        description: >-
+          Build /System/Library/MediaCapture/H6ISP.mediacapture and stage it into the seed at
+          /private/var/ngpu/mediacapture. The kernel's fifth addon mount (window 0xe00,
+          patches/xnu/zze-dby-torch-media-mount.patch, gated by dby-torch=1 dby-ti=1) presents that directory over
+          /System/Library/MediaCapture, which is the path BWFigCaptureDeviceVendor dlopens for a service of class
+          AppleH6CamIn; without that file dby_torch_ios_commit() refuses to publish at all, which is what the
+          2026-11-09 boot read as `[torch] ios not made: the plug-in is not on the root`. Staging chains onto
+          data-audio.dbr whenever audio_hal built one, so one seed carries both plug-ins.
+        type: boolean
+        default: false
+      camera_test_pattern:
+        description: >-
+          Also stage the zero-length marker ngpu/mediacapture/DbyCameraTestPattern, the file DbyCameraProvider.m
+          checks before it registers the CMIOExtension provider that emits the scrolling test image. A marker and not
+          a boot argument, because the armed command line measures 998 of the 1000 bytes the payload gate allows. With
+          this off the plug-in still carries the flashlight and the vendor-class fix and no camera device appears.
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -163,6 +197,15 @@ jobs:
           repository: ${{ inputs.sheng_repository }}
           ref: ${{ inputs.sheng_commit }}
           path: kit
+          persist-credentials: false
+
+      - name: Check out the board scripts
+        if: inputs.camera_plugin
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ inputs.board_repository }}
+          ref: ${{ inputs.board_commit }}
+          path: board
           persist-credentials: false
 
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
@@ -695,6 +738,49 @@ jobs:
           stat -f '%z %N' "$RUNNER_TEMP/data-audio.dbr"
           cat "$RUNNER_TEMP/data-audio.json"
 
+      - name: Build the MediaCapture plug-in
+        if: inputs.camera_plugin
+        run: |
+          # One Mach-O out of two plug-ins, because the mother board's record says a torch-only bundle cannot work: the
+          # vendor class BWFigCaptureDeviceVendor is nil on a device (its init bails at 0x1a693fde0 when the default
+          # create function is empty and kern.hv_vmm_present is 0), so the six methods DbyTorchPlugin.m replaces would
+          # be sent to nil unless DbyCameraProvider.m's own constructor fixes that init from the same file first. The
+          # builder refuses to export any CaptureDeviceCreate, so the fix adds no camera device either way.
+          # arm64-apple-ios17.0 and codesign --pagesize 4096 are what the audio server plug-in uses, and the ad hoc
+          # signature is why the CDHash has to join the owner trust cache instead of the file standing on its own.
+          xcrun --sdk iphoneos --show-sdk-path
+          python3 board/scripts/build-dby-camera-plugin.py --out "$RUNNER_TEMP/dby-camera-plugin"
+          codesign --display --verbose=4 "$RUNNER_TEMP/dby-camera-plugin/H6ISP.mediacapture"
+          cat "$RUNNER_TEMP/dby-camera-plugin/trust.json"
+          # What the staging step copies, and nothing else.
+          stat -f '%z %N' "$RUNNER_TEMP/dby-camera-plugin/H6ISP.mediacapture" "$RUNNER_TEMP/dby-camera-plugin/trust.json"
+
+      - name: Stage the MediaCapture plug-in into the seed
+        if: inputs.camera_plugin && !inputs.audio_only
+        run: |
+          set -euo pipefail
+          # The carrier is the seed, not the addon blob: the loader flashed on this board does not publish GpuAddon, so
+          # native_gpu_addon_install() returns early and only the union mounts run, and those read their source from
+          # the Data volume. Staging keeps the volume UUID, so over data-final.dbr or data-audio.dbr this seed costs no
+          # kernel rebuild, and BASE is not modified. Unlike the audio step this runs the script from the checkout: the
+          # inlining there exists only because this token cannot create a path in this repository, while the board
+          # scripts are already committed in the board repository, so nothing here is duplicated and --plugin points at
+          # the built bundle instead of the script's own build/ directory (the trap run #16 of 2026-11-08 died on).
+          # The base is the audio seed whenever this run built one: the board that works today ships
+          # /private/var/ngpu/audio/ShengAudio.driver inside its seed, and a camera seed grown from data-final.dbr
+          # instead would hand back a payload with no audio plug-in and take the speaker down with it. The recorded
+          # base_sha256 in data-camera.json is what makes that chain evidence rather than a claim.
+          base="$RUNNER_TEMP/data-final.dbr"
+          if [ '${{ inputs.audio_hal }}' = true ] && [ -f "$RUNNER_TEMP/data-audio.dbr" ]; then
+            base="$RUNNER_TEMP/data-audio.dbr"
+          fi
+          stat -f '%z %N' "$base"
+          UNIXNU_CORE="$GITHUB_WORKSPACE" python3 board/scripts/add-dby-camera-data.py \
+            ${{ inputs.camera_test_pattern && '--test-pattern' || '' }} \
+            --plugin "$RUNNER_TEMP/dby-camera-plugin" "$base" "$RUNNER_TEMP/data-camera.dbr"
+          stat -f '%z %N' "$RUNNER_TEMP/data-camera.dbr"
+          cat "$RUNNER_TEMP/data-camera.json"
+
       - name: Report the seeds
         if: always()
         run: |
@@ -720,6 +806,8 @@ jobs:
             ${{ runner.temp }}/data-final.json
             ${{ runner.temp }}/data-audio.dbr
             ${{ runner.temp }}/data-audio.json
+            ${{ runner.temp }}/data-camera.dbr
+            ${{ runner.temp }}/data-camera.json
           if-no-files-found: ignore
           retention-days: 1
 
@@ -732,6 +820,17 @@ jobs:
             ${{ runner.temp }}/sheng-audio-hal/ShengAudio.driver/Info.plist
             ${{ runner.temp }}/sheng-audio-hal/ShengAudio.driver/ShengAudio
             ${{ runner.temp }}/sheng-audio-hal/trust.json
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Upload the MediaCapture plug-in
+        if: inputs.camera_plugin
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: unixnu-dby-camera-plugin-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/dby-camera-plugin/H6ISP.mediacapture
+            ${{ runner.temp }}/dby-camera-plugin/trust.json
           if-no-files-found: error
           retention-days: 1
 
@@ -749,6 +848,7 @@ jobs:
             echo '| data-grow.dbr | grown to the userdata partition |'
             echo '| data-final.dbr | grown and Setup marked done; this is the seed the board ships |'
             echo '| data-audio.dbr | data-final.dbr plus /private/var/ngpu/audio/ShengAudio.driver; this is the seed the board ships when audio_hal is on |'
+          echo '| data-camera.dbr | data-audio.dbr (or data-final.dbr with audio_hal off) plus /private/var/ngpu/mediacapture/H6ISP.mediacapture and the DbyCameraTestPattern marker; this is the seed the board ships when camera_plugin is on |'
             echo '| sheng-audio-hal/ShengAudio.driver | the compiled CoreAudio server plug-in, in its own artifact unixnu-sheng-audio-hal-RUN-ATTEMPT |'
             echo
             echo 'A grown seed is only deliverable packed: [payload.adt] packed_data_ramdisk = true makes the ADT'
@@ -779,6 +879,12 @@ jobs:
             echo '`mount4=stage/status`. With audio_only no seed is produced, which is deliberate:'
             echo 'docs/porting/packaging.md:136-137 states that GPU and audio updates travel in the addon and do not'
             echo 'edit the Data seed, so the board'"'"'s existing seed keeps its volume UUID and no kernel rebuild.'
+            echo
+            echo 'With camera_plugin the same holds for `dby-camera-plugin/trust.json`: the CDHash of the exact bytes that'
+            echo 'were compiled is what `scripts/add-dby-camera-trust.py` puts into the owner trust bundle, because'
+            echo 'mediaserverd is a platform process and AMFI refuses to map an ad hoc bundle that no trusted cache names.'
+            echo 'The plug-in artifact and data-camera.dbr of one run are therefore a pair: rebuild the plug-in, and the'
+            echo 'pair has to be re-made, with the predecessor'"'"'s hash dropped from the owner module.'
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Remove proprietary inputs
@@ -788,5 +894,7 @@ jobs:
           hdiutil detach "$PWD/.cache/firmware/target-volumes/os-mount" -force || true
           rm -rf out/ipsw .cache/firmware device/.cache/firmware build/owner-data-fixture
           rm -f "$RUNNER_TEMP"/data-32.dbr "$RUNNER_TEMP"/data-qemu.dbr "$RUNNER_TEMP"/data-grow.dbr "$RUNNER_TEMP"/data-final.dbr
+          rm -f "$RUNNER_TEMP"/data-camera.dbr "$RUNNER_TEMP"/data-camera.json
           rm -rf "$RUNNER_TEMP"/sheng-audio-hal kit
+          rm -rf "$RUNNER_TEMP"/dby-camera-plugin board
           rm -rf "$RUNNER_TEMP"/grow-qemu
