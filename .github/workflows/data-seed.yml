@@ -1034,6 +1034,8 @@ jobs:
             ${{ runner.temp }}/data-audio.json
             ${{ runner.temp }}/data-camera.dbr
             ${{ runner.temp }}/data-camera.json
+            ${{ runner.temp }}/data-gpu.dbr
+            ${{ runner.temp }}/data-gpu.json
           if-no-files-found: ignore
           retention-days: 1
 
