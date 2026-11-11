@@ -1055,6 +1055,19 @@ jobs:
           if old_link not in text:
               raise SystemExit('check-turnip-darwin-host.py no longer links shim_obj where this step expects')
           text = text.replace(old_link, "shim_obj, hooks_obj, *core, *objects,", 1)
+          # The quartzcore cache check runs under check=True, which swallows its stderr and leaves only "returned
+          # non-zero exit status 1". Its own message is what says whether a file the board package expects is missing
+          # here or whether a pinned input differs, so the reason is printed instead of being lost.
+          old_q = ("    subprocess.run([sys.executable, ROOT / 'scripts/check-quartzcore-turnip-cache-host.py',\n"
+                   "                    '--output', Path(temporary) / 'control'], check=True, timeout=660)")
+          new_q = ("    _q = subprocess.run([sys.executable, ROOT / 'scripts/check-quartzcore-turnip-cache-host.py',\n"
+                   "                    '--output', Path(temporary) / 'control'], capture_output=True, text=True, timeout=660)\n"
+                   "    if _q.returncode:\n"
+                   "        print(_q.stdout or '', end=''); print(_q.stderr or '', end='')\n"
+                   "        sys.exit('The quartzcore driver cache control failed (exit %d)' % _q.returncode)")
+          if old_q not in text:
+              raise SystemExit('check-turnip-darwin-host.py no longer runs the quartzcore cache check where this step expects')
+          text = text.replace(old_q, new_q, 1)
           host_check.write_text(text)
           PY
           # The host service opens the user client with input_bits=31 and never calls setScope, so window_bytes_ stays
