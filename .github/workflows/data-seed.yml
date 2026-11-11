@@ -149,6 +149,31 @@ on:
           this off the plug-in still carries the flashlight and the vendor-class fix and no camera device appears.
         type: boolean
         default: true
+      gpu_plugin:
+        description: >-
+          Build the owner Adreno Metal plug-in and stage it into the seed at /private/var/ngpu/addons, which the
+          kernel's first addon mount (window 0x400, sheng-gpu-addon=1) presents as a read-only union over
+          /System/Library/Extensions -- the path the original Metal discovery reads MetalPluginName from. Without the
+          plug-in in the seed the device composites the whole UI on the CPU.
+        type: boolean
+        default: false
+      gpu_publish:
+        description: >-
+          Write /private/var/ngpu/addons/NativeAdrenoMetal.publish. docs/drivers/native-adreno.md states the
+          consequence exactly: with the marker the plug-in returns the native Metal device to the original discovery
+          in backboardd and CARenderServer composites through it; without it the plug-in only runs its own tests. It
+          also writes CAEnableDeepFramebuffer, CAEnableFramebufferCompression and CAEnableIOSurfaceCompression = false
+          for mobile and root, because the render server picks a 10-bit deep framebuffer unless told not to and reads
+          that preference before any plug-in code can run.
+        type: boolean
+        default: true
+      gpu_clients:
+        description: >-
+          Processes besides backboardd that get their own native Metal device, comma separated (empty = none,
+          "*" = every process). A listed process also gets a 256 MiB GPU window and its own shader cache; any other
+          process keeps the software renderer.
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -780,6 +805,48 @@ jobs:
             --plugin "$RUNNER_TEMP/dby-camera-plugin" "$base" "$RUNNER_TEMP/data-camera.dbr"
           stat -f '%z %N' "$RUNNER_TEMP/data-camera.dbr"
           cat "$RUNNER_TEMP/data-camera.json"
+
+      - name: Build the Adreno Metal plug-in
+        if: inputs.gpu_plugin
+        run: |
+          # Three products, in the order the builders demand them: Turnip (Mesa's Adreno Vulkan driver compiled for
+          # Darwin arm64), the Rust bridge archive, then the plug-in bundle. scripts/build-adreno-metal-plugin.py
+          # refuses to start without build/mesa-tu-ios/src/freedreno/vulkan/libvulkan_freedreno.dylib, which is the
+          # first command's output, and it links the archive the second one produces.
+          # The target is ios (arm64-apple-ios17.0): the same architecture the audio and MediaCapture plug-ins use,
+          # so one owner trust cache can name all three CDHashes.
+          python3 scripts/build-turnip-darwin.py --target ios
+          python3 scripts/build-adreno-metal-bridge.py
+          python3 scripts/build-adreno-metal-plugin.py --target ios
+          ls -l build/adreno-metal-plugin/ | tail -30
+          stat -f '%z %N' build/adreno-metal-plugin/NativeAdrenoMetal.bundle/NativeAdrenoMetal \
+            build/adreno-metal-plugin/NativeAdrenoMetal.bundle/libvulkan_freedreno.dylib \
+            build/adreno-metal-plugin/NativeAdrenoMetal.bundle/Info.plist
+          cat build/adreno-metal-plugin/trust.json
+
+      - name: Stage the Adreno Metal plug-in into the seed
+        if: inputs.gpu_plugin && !inputs.audio_only
+        run: |
+          set -euo pipefail
+          # core's own scripts/add-gpu-plugin-data.py, run from the checkout: this step only adds files under
+          # /private/var/ngpu/addons, so it needs none of the mount-format knowledge the audio script had to inline.
+          # The chains are the ones the camera step uses, so a run with gpu_plugin on top of audio_hal and
+          # camera_plugin produces one seed that carries all three plug-ins and the kernel's mounts 0x400, 0xa00 and
+          # 0xe00 all find their source.
+          base="$RUNNER_TEMP/data-final.dbr"
+          if [ '${{ inputs.audio_hal }}' = true ] && [ -f "$RUNNER_TEMP/data-audio.dbr" ]; then
+            base="$RUNNER_TEMP/data-audio.dbr"
+          fi
+          if [ '${{ inputs.camera_plugin }}' = true ] && [ -f "$RUNNER_TEMP/data-camera.dbr" ]; then
+            base="$RUNNER_TEMP/data-camera.dbr"
+          fi
+          stat -f '%z %N' "$base"
+          args=()
+          if [ '${{ inputs.gpu_publish }}' = true ]; then args+=(--publish); fi
+          if [ -n '${{ inputs.gpu_clients }}' ]; then args+=(--clients '${{ inputs.gpu_clients }}'); fi
+          python3 scripts/add-gpu-plugin-data.py "${args[@]}" "$base" "$RUNNER_TEMP/data-gpu.dbr"
+          stat -f '%z %N' "$RUNNER_TEMP/data-gpu.dbr"
+          cat "$RUNNER_TEMP/data-gpu.json"
 
       - name: Report the seeds
         if: always()
