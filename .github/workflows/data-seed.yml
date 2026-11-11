@@ -867,9 +867,10 @@ jobs:
           # initialise drivers/DarwinBoot, and the two directories the build steps still name by their old names
           # point at the real ones - build-adreno-metal-plugin.py also reads NativeAdrenoMetalPlugin.mm and
           # NativeAdrenoProbeDaemon.cpp from drivers/NativeMetal - rather than the upstream scripts being edited.
-          git submodule update --init --depth 1 drivers/Adreno740 drivers/AdrenoMetal kits/AdrenoPM4
+          git submodule update --init --depth 1 drivers/Adreno740 drivers/AdrenoMetal kits/AdrenoPM4 kits/ArmSmmu4K
           test -f drivers/Adreno740/NativeAdrenoABI.h
           test -f drivers/AdrenoMetal/NativeAdrenoMetalPlugin.mm
+          test -f kits/ArmSmmu4K/ArmSmmu4KContext.c
           ln -sfn Adreno740 drivers/NativeAdreno
           ln -sfn AdrenoMetal drivers/NativeMetal
           # scripts/mesa_patch_identity.py reverse-applies the recorded patches to prove the tree carries exactly
@@ -975,6 +976,9 @@ jobs:
           # The target is ios (arm64-apple-ios17.0): the same architecture the audio and MediaCapture plug-ins use,
           # so one owner trust cache can name all three CDHashes.
           python3 scripts/build-turnip-darwin.py --target ios
+          # gen-turnip-replay.py, called from the plug-in build, runs check-turnip-darwin-host.py, which refuses
+          # without a host build of the same source: "Build the host Turnip first".
+          python3 scripts/build-turnip-darwin.py --target host
           python3 scripts/build-adreno-metal-bridge.py
           python3 scripts/build-adreno-metal-plugin.py --target ios
           ls -l build/adreno-metal-plugin/ | tail -30
