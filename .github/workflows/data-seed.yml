@@ -904,6 +904,18 @@ jobs:
           # gen-turnip-smoke-shaders.py, called by build-adreno-metal-plugin.py, compiles the smoke shaders with
           # glslc (shaderc), which is a separate formula from glslang.
           brew list shaderc >/dev/null 2>&1 || brew install shaderc
+          # check-turnip-darwin-host.py compiles vulkan_smoke.c with -I /opt/homebrew/include, so the Vulkan headers
+          # have to be there: run #43081894740 built and linked the whole host library and then stopped on
+          # "vulkan/vulkan.h file not found". vulkan-headers is keg-only, so it is linked into the prefix the check
+          # already searches rather than the include path being changed.
+          brew list vulkan-headers >/dev/null 2>&1 || brew install vulkan-headers
+          brew link --force vulkan-headers >/dev/null 2>&1 || true
+          if [ ! -f /opt/homebrew/include/vulkan/vulkan.h ]; then
+            prefix=$(brew --prefix vulkan-headers)
+            mkdir -p /opt/homebrew/include
+            cp -R "$prefix/include/vulkan" /opt/homebrew/include/
+          fi
+          test -f /opt/homebrew/include/vulkan/vulkan.h
           # build-adreno-metal-bridge.py assembles its fixture with llvm-as (LLVM 21 or newer, looked up at
           # /opt/homebrew/opt/llvm/bin first) and runs cargo +1.98.0.
           brew list llvm >/dev/null 2>&1 || brew install llvm
