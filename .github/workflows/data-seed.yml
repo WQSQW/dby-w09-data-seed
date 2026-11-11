@@ -1014,10 +1014,12 @@ jobs:
           marker = 'extern "C" {\nvolatile uint32_t native_gpu_dcvs[15];'
           if marker not in text:
               raise SystemExit('host_iokit_shim.cpp no longer ends with the board-symbol block this step extends')
+          if '#include <mach/mach_time.h>' not in text:
+              text = text.replace('#include <mach/mach.h>', '#include <mach/mach.h>\n#include <mach/mach_time.h>', 1)
           addition = (
               '\n/* Board symbols the newer driver sources name, absent from the host: a monotonic clock and a recorder\n'
               ' * that drops its records, since this Mac has no GPU and no trace ring. */\n'
-              'uint64_t native_adreno_now_us(void) {return (uint64_t)(clock_gettime_nsec_np(CLOCK_MONOTONIC) / 1000);}\n'
+              'uint64_t native_adreno_now_us(void) {return (uint64_t)(mach_absolute_time() / 1000);}\n'
               'void native_gpu_trace_record(uint32_t event, uint32_t pid, const uint64_t *values, uint32_t count)\n'
               '    {(void)event; (void)pid; (void)values; (void)count;}\n')
           shim.write_text(text.replace(marker, marker + addition, 1))
