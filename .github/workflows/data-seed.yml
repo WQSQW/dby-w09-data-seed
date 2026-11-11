@@ -900,6 +900,12 @@ jobs:
           # so the toolchain the build names is installed here before it runs.
           brew list glslang >/dev/null 2>&1 || brew install glslang
           brew list ninja >/dev/null 2>&1 || brew install ninja
+          # build-adreno-metal-bridge.py assembles its fixture with llvm-as (LLVM 21 or newer, looked up at
+          # /opt/homebrew/opt/llvm/bin first) and runs cargo +1.98.0.
+          brew list llvm >/dev/null 2>&1 || brew install llvm
+          if ! rustup toolchain list | grep -q '^1\.98\.0'; then rustup toolchain install 1.98.0; fi
+          /opt/homebrew/opt/llvm/bin/llvm-as --version | head -2
+          cargo +1.98.0 --version
           python3 -m venv .cache/mesa-venv
           .cache/mesa-venv/bin/pip install --quiet --upgrade pip
           .cache/mesa-venv/bin/pip install --quiet 'meson>=1.3' mako pyyaml packaging
@@ -932,6 +938,33 @@ jobs:
           .cache/mesa-tools/bin/bison --version | head -1
           .cache/mesa-venv/bin/meson --version
           glslangValidator --version | head -2
+
+      - name: Check out the pinned metal2vulkan translator
+        if: inputs.gpu_plugin
+        run: |
+          set -euo pipefail
+          # build-adreno-metal-bridge.py opens .cache/gpu-reference/metal2vulkan and compares its HEAD with the
+          # commit in scripts/data/gpu-metal-vulkan-inputs.json, exactly as build-turnip-darwin.py does for Mesa.
+          # Like the Mesa checkout, no script here creates it: run #43014610596 built Turnip, then stopped at
+          # "cannot change to .../.cache/gpu-reference/metal2vulkan".
+          python3 - "$GITHUB_WORKSPACE" <<'PY' >"$RUNNER_TEMP/translator-pin.env"
+          import json
+          import pathlib
+          import shlex
+          import sys
+
+          pins = json.loads((pathlib.Path(sys.argv[1]) / 'scripts/data/gpu-metal-vulkan-inputs.json').read_text())['translator']
+          print('TRANSLATOR_COMMIT=' + shlex.quote(pins['commit']))
+          print('TRANSLATOR_REPO=' + shlex.quote(pins['repository']))
+          PY
+          . "$RUNNER_TEMP/translator-pin.env"
+          work="$GITHUB_WORKSPACE/.cache/gpu-reference/metal2vulkan"
+          mkdir -p "$(dirname "$work")"
+          git clone --filter=blob:none --no-checkout "$TRANSLATOR_REPO" "$work"
+          git -C "$work" fetch --depth 1 origin "$TRANSLATOR_COMMIT"
+          git -C "$work" checkout --detach "$TRANSLATOR_COMMIT"
+          git -C "$work" rev-parse HEAD
+          test "$(git -C "$work" rev-parse HEAD)" = "$TRANSLATOR_COMMIT"
           # The target is ios (arm64-apple-ios17.0): the same architecture the audio and MediaCapture plug-ins use,
           # so one owner trust cache can name all three CDHashes.
           python3 scripts/build-turnip-darwin.py --target ios
