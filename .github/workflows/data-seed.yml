@@ -1023,6 +1023,18 @@ jobs:
               'void native_gpu_trace_record(uint32_t event, uint32_t pid, const uint64_t *values, uint32_t count)\n'
               '    {(void)event; (void)pid; (void)values; (void)count;}\n')
           shim.write_text(text.replace(marker, marker + addition, 1))
+          # The core list check-turnip-darwin-host.py compiles omits two sources the newer driver links against:
+          # NativeAdrenoMemory calls NativeAdrenoPoolAllocate, -Release and -Contains, and NativeAdrenoRing and
+          # NativeAdrenoSubmit call NativeAdrenoPreempt. The link then fails on exactly those symbols, so the list
+          # gains the two files rather than the shim gaining fake definitions for real functionality.
+          host_check = pathlib.Path('scripts/check-turnip-darwin-host.py')
+          text = host_check.read_text()
+          old = "'NativeAdrenoUserClient', 'NativeAdrenoTimer', 'NativeAdrenoSmmuContext', 'NativeAdrenoGpuContext']:"
+          new = ("'NativeAdrenoUserClient', 'NativeAdrenoTimer', 'NativeAdrenoSmmuContext', 'NativeAdrenoGpuContext',\n"
+                 "             'NativeAdrenoPool', 'NativeAdrenoPreempt']:")
+          if old not in text:
+              raise SystemExit('check-turnip-darwin-host.py no longer has the core list this step extends')
+          host_check.write_text(text.replace(old, new, 1))
           PY
           python3 scripts/build-adreno-metal-bridge.py
           python3 scripts/build-adreno-metal-plugin.py --target ios
