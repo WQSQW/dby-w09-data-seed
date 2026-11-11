@@ -961,11 +961,6 @@ jobs:
 
       - name: Check out the pinned metal2vulkan translator and build the plug-in
         if: inputs.gpu_plugin
-        env:
-          # The host smoke test's own switch for printing every allocation size and every failing call. Turnip came
-          # up on the host model and then failed its first BO with VK_ERROR_OUT_OF_DEVICE_MEMORY, and the summary
-          # line ("1 free GPU ranges") does not say which allocation or which limit refused it.
-          HOSTSIM_TRACE: '1'
         run: |
           set -euo pipefail
           # build-adreno-metal-bridge.py opens .cache/gpu-reference/metal2vulkan and compares its HEAD with the
@@ -992,6 +987,10 @@ jobs:
           test "$(git -C "$work" rev-parse HEAD)" = "$TRANSLATOR_COMMIT"
           # The target is ios (arm64-apple-ios17.0): the same architecture the audio and MediaCapture plug-ins use,
           # so one owner trust cache can name all three CDHashes.
+          # host_gpu_service.cpp's own switch: every allocation size and every failing call on stderr. The last run
+          # brought Turnip up on the host model and then failed the first BO with VK_ERROR_OUT_OF_DEVICE_MEMORY,
+          # and "1 free GPU ranges" does not say which allocation or which limit refused it.
+          export HOSTSIM_TRACE=1
           python3 scripts/build-turnip-darwin.py --target ios
           # gen-turnip-replay.py, called from the plug-in build, runs check-turnip-darwin-host.py, which refuses
           # without a host build of the same source: "Build the host Turnip first".
