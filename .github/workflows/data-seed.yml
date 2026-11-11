@@ -961,6 +961,11 @@ jobs:
 
       - name: Check out the pinned metal2vulkan translator and build the plug-in
         if: inputs.gpu_plugin
+        env:
+          # The host smoke test's own switch for printing every allocation size and every failing call. Turnip came
+          # up on the host model and then failed its first BO with VK_ERROR_OUT_OF_DEVICE_MEMORY, and the summary
+          # line ("1 free GPU ranges") does not say which allocation or which limit refused it.
+          HOSTSIM_TRACE: '1'
         run: |
           set -euo pipefail
           # build-adreno-metal-bridge.py opens .cache/gpu-reference/metal2vulkan and compares its HEAD with the
