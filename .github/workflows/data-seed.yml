@@ -1057,6 +1057,32 @@ jobs:
           text = text.replace(old_link, "shim_obj, hooks_obj, *core, *objects,", 1)
           host_check.write_text(text)
           PY
+          # The host service opens the user client with input_bits=31 and never calls setScope, so window_bytes_ stays
+          # 0 and GetDeviceInfo reports va_size 0. Turnip sizes its IOVA heap from va_size, so the very first BO has
+          # nowhere to be mapped: "TU: tu_device.cc: BO init (VK_ERROR_OUT_OF_DEVICE_MEMORY)", with the driver's own
+          # BO allocation succeeding (hostgpu alloc 32768 -> 0). NativeAdrenoPublish.cpp shows the board path: a
+          # client gets a window from clientWindowBytes(input_bits), which needs input_bits > 32, set with
+          # setScope(base, GpuClientVaStart, window). The host service gets the same treatment at 36 bits.
+          python3 - <<'PY'
+          import pathlib
+
+          service = pathlib.Path('drivers/Adreno740/tests/hostsim/host_gpu_service.cpp')
+          text = service.read_text()
+          old_open = "const IOReturn st=client.open(NativeAdrenoAbiVersion,context->vm(),&execbuf,&ring,31,40);"
+          new_open = ("const IOReturn st=client.open(NativeAdrenoAbiVersion,context->vm(),&execbuf,&ring,36,40);")
+          if old_open not in text:
+              raise SystemExit('host_gpu_service.cpp no longer opens the client where this step expects')
+          text = text.replace(old_open, new_open, 1)
+          old_ok = "if(st) {std::fprintf(stderr,\"host gpu: client open failed %d\\n\",st);return kIOReturnNotReady;}"
+          new_ok = (old_ok + "\n"
+                    "    /* The window the board gives a user connection: GpuClientVaStart to the 36-bit aperture's end. */\n"
+                    "    if(const IOReturn scoped=client.setScope(0,GpuClientVaStart,(UINT64_C(1)<<36)-GpuClientVaStart))\n"
+                    "        {std::fprintf(stderr,\"host gpu: client scope failed %d\\n\",scoped);return kIOReturnNotReady;}")
+          if old_ok not in text:
+              raise SystemExit('host_gpu_service.cpp no longer reports a failed open where this step expects')
+          text = text.replace(old_ok, new_ok, 1)
+          service.write_text(text)
+          PY
           python3 scripts/build-adreno-metal-bridge.py
           python3 scripts/build-adreno-metal-plugin.py --target ios
           ls -l build/adreno-metal-plugin/ | tail -30
