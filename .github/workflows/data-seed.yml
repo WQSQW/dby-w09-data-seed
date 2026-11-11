@@ -20,6 +20,14 @@ on:
         description: UniXNU ref to build the seed with
         required: true
         default: main
+      seed_url:
+        description: >-
+          Download the base seed from this URL instead of formatting a new fixture or restoring a previous run's
+          artifact. For a seed that already carries the audio and MediaCapture plug-ins this costs no IPSW fetch and
+          no grow, so a plug-in round is minutes instead of an hour. The volume UUID inside the file is preserved by
+          staging, so the kernel's CONFIG_XNU_OWNER_DATA_VOLUME_UUID pin still matches and no kernel rebuild follows.
+        type: string
+        default: ''
       base_seed:
         description: >-
           Run ID whose data-32.dbr to grow instead of formatting a fresh fixture. scripts/seed-data-grow.py
@@ -330,15 +338,32 @@ jobs:
             echo 'no seed.json in the base artifact: this run inherits the base seed UUID'
           fi
 
+      - name: Download the base seed
+        if: inputs.seed_url != '' && !inputs.audio_only
+        run: |
+          set -euo pipefail
+          # A seed that already carries the audio and MediaCapture plug-ins: staging adds the GPU addon directory
+          # beside them and leaves the volume UUID alone, so nothing here reads the IPSW, formats a fixture or grows
+          # the container. The URL is masked because it carries a token.
+          seed_url=$(jq -r '.inputs.seed_url // ""' "$GITHUB_EVENT_PATH")
+          echo "::add-mask::$seed_url"
+          curl -fsSL --retry 3 "$seed_url" -o "$RUNNER_TEMP/data-final.dbr"
+          stat -f '%z %N' "$RUNNER_TEMP/data-final.dbr"
+          shasum -a 256 "$RUNNER_TEMP/data-final.dbr"
+          # The DBRDISK1 header records the logical size and content hash, so the base is checked, not trusted:
+          # staging a corrupt seed would only show up as a mount failure on the board.
+          git submodule update --init --depth 1 drivers/DarwinBoot
+          PYTHONPATH=drivers/DarwinBoot/Test python3 -c "import sys,packed_ramdisk;print(packed_ramdisk.inspect(sys.argv[1]))" "$RUNNER_TEMP/data-final.dbr"
+
       - name: Fetch the OS volume from the target IPSW
-        if: inputs.base_seed == '' && !inputs.audio_only
+        if: inputs.base_seed == '' && inputs.seed_url == '' && !inputs.audio_only
         run: |
           # Range-reads the member, never the whole IPSW, and enforces the [ipsw.sha256] pin of the board.
           ./unixnu ipsw -D "$UNIXNU_DEVICE" fetch OS
           ls -l out/ipsw/*/
 
       - name: Attach the OS volume read-only
-        if: inputs.base_seed == '' && !inputs.audio_only
+        if: inputs.base_seed == '' && inputs.seed_url == '' && !inputs.audio_only
         run: |
           dmg=$(ls "$PWD"/out/ipsw/*/044-76040-038.dmg)
           mkdir -p .cache/firmware/target-volumes/os-mount
@@ -365,14 +390,14 @@ jobs:
           PY
 
       - name: Create the Data seed
-        if: inputs.base_seed == '' && !inputs.audio_only
+        if: inputs.base_seed == '' && inputs.seed_url == '' && !inputs.audio_only
         run: |
           # Refuses unless .cache/firmware/target-volumes/os-mount/sbin/launchd is the unchanged original.
           python3 scripts/prepare-owner-data-fixture.py --output build/owner-data-fixture
           cat build/owner-data-fixture/seed.json
 
       - name: Pack the seed into DBRDISK1
-        if: inputs.base_seed == '' && !inputs.audio_only
+        if: inputs.base_seed == '' && inputs.seed_url == '' && !inputs.audio_only
         run: |
           # seed-data-grow.py and seed-data-skip-setup.py both take a packed base; the fixture output is dense raw APFS.
           git submodule update --init --depth 1 drivers/DarwinBoot
