@@ -831,6 +831,50 @@ jobs:
           stat -f '%z %N' "$RUNNER_TEMP/data-camera.dbr"
           cat "$RUNNER_TEMP/data-camera.json"
 
+      - name: Check out the pinned Mesa source
+        if: inputs.gpu_plugin
+        run: |
+          set -euo pipefail
+          # scripts/build-turnip-darwin.py opens .cache/mesa-work and refuses to run unless its HEAD is the commit
+          # pinned in scripts/data/adreno-compiler-inputs.json. No script in this repository creates that checkout:
+          # docs/zh/porting/migration.md lists it as a local build input the operator supplies, so it is fetched here.
+          # The sparse directory list is the pin's own, and a partial clone keeps the download to what the build reads.
+          python3 - "$GITHUB_WORKSPACE" <<'PY' >"$RUNNER_TEMP/mesa-pin.env"
+          import json
+          import pathlib
+          import shlex
+          import sys
+
+          pins = json.loads((pathlib.Path(sys.argv[1]) / 'scripts/data/adreno-compiler-inputs.json').read_text())['mesa']
+          print('MESA_COMMIT=' + shlex.quote(pins['commit']))
+          print('MESA_MIRROR=' + shlex.quote(pins['mirror']))
+          print('MESA_SPARSE=' + shlex.quote(' '.join(pins['sparse_directories'])))
+          PY
+          . "$RUNNER_TEMP/mesa-pin.env"
+          work="$GITHUB_WORKSPACE/.cache/mesa-work"
+          git clone --filter=blob:none --no-checkout --depth 1 "$MESA_MIRROR" "$work"
+          git -C "$work" sparse-checkout set --no-cone $MESA_SPARSE
+          git -C "$work" fetch --depth 1 origin "$MESA_COMMIT"
+          git -C "$work" checkout --detach "$MESA_COMMIT"
+          # The build compares this against the pin itself, so print what it will see instead of trusting the above.
+          git -C "$work" rev-parse HEAD
+          test "$(git -C "$work" rev-parse HEAD)" = "$MESA_COMMIT"
+          # scripts/mesa_patch_identity.py reverse-applies the recorded patches to prove the tree carries exactly
+          # them, and rejects any change the pin does not name. They are applied here in the pin's order.
+          python3 - "$GITHUB_WORKSPACE" "$work" <<'PY'
+          import json
+          import pathlib
+          import subprocess
+          import sys
+
+          root, work = pathlib.Path(sys.argv[1]), sys.argv[2]
+          pins = json.loads((root / 'scripts/data/adreno-compiler-inputs.json').read_text())
+          for patch in pins['patches']:
+              subprocess.run(['git', '-C', work, 'apply', '--whitespace=nowarn', str(root / patch)], check=True)
+              print('applied', patch)
+          PY
+          git -C "$work" diff --stat HEAD | tail -5
+
       - name: Build the Adreno Metal plug-in
         if: inputs.gpu_plugin
         run: |
@@ -838,6 +882,18 @@ jobs:
           # Darwin arm64), the Rust bridge archive, then the plug-in bundle. scripts/build-adreno-metal-plugin.py
           # refuses to start without build/mesa-tu-ios/src/freedreno/vulkan/libvulkan_freedreno.dylib, which is the
           # first command's output, and it links the archive the second one produces.
+          # build-turnip-darwin.py runs .cache/mesa-venv/bin/meson and puts .cache/mesa-tools/bin ahead of PATH, and
+          # it stops on a missing glslangValidator. Neither directory is created by any script in this repository,
+          # so the toolchain the build names is installed here before it runs.
+          brew list glslang >/dev/null 2>&1 || brew install glslang
+          brew list ninja >/dev/null 2>&1 || brew install ninja
+          python3 -m venv .cache/mesa-venv
+          .cache/mesa-venv/bin/pip install --quiet --upgrade pip
+          .cache/mesa-venv/bin/pip install --quiet 'meson>=1.3' mako pyyaml packaging
+          mkdir -p .cache/mesa-tools/bin
+          ln -sf "$(command -v ninja)" .cache/mesa-tools/bin/ninja
+          .cache/mesa-venv/bin/meson --version
+          glslangValidator --version | head -2
           # The target is ios (arm64-apple-ios17.0): the same architecture the audio and MediaCapture plug-ins use,
           # so one owner trust cache can name all three CDHashes.
           python3 scripts/build-turnip-darwin.py --target ios
