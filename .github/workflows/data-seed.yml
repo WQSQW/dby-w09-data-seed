@@ -233,7 +233,7 @@ jobs:
           persist-credentials: false
 
       - name: Check out the board scripts
-        if: inputs.camera_plugin
+        if: inputs.camera_plugin || inputs.gpu_plugin
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ${{ inputs.board_repository }}
@@ -1083,6 +1083,17 @@ jobs:
           text = text.replace(old_ok, new_ok, 1)
           service.write_text(text)
           PY
+          # check-turnip-darwin-host.py calls scripts/check-quartzcore-turnip-cache-host.py unconditionally, and core
+          # does not ship that file: it exists only in the sheng board package. Run #43110854555 got every Turnip
+          # check through - the deferred BO cases and the pipeline cache produce/consume/miss controls - and then
+          # died on "can't open file .../check-quartzcore-turnip-cache-host.py". The file is fetched from the board
+          # package it lives in rather than from this repository's own board checkout, which does not carry it.
+          if [ ! -f scripts/check-quartzcore-turnip-cache-host.py ]; then
+            curl -fsSL --retry 3 \
+              "https://raw.githubusercontent.com/UniXNU/UniXNU-sheng/main/scripts/check-quartzcore-turnip-cache-host.py" \
+              -o scripts/check-quartzcore-turnip-cache-host.py
+          fi
+          test -f scripts/check-quartzcore-turnip-cache-host.py
           python3 scripts/build-adreno-metal-bridge.py
           python3 scripts/build-adreno-metal-plugin.py --target ios
           ls -l build/adreno-metal-plugin/ | tail -30
