@@ -1002,37 +1002,20 @@ jobs:
               '#define PRIO_DARWIN_GPU_UI_FOCAL      0x7\n'
               '#endif\n')
           PY
-          # The same host-include trick covers the board symbols the newer driver sources name: host_iokit_shim.cpp
-          # already defines native_gpu_dcvs and PE_parse_boot_argn for exactly this reason, but the user client now
-          # also calls native_adreno_now_us and the submit path native_gpu_trace_record. The host has no GPU and no
-          # trace ring, so they answer as the shim's other stand-ins do: a monotonic clock and a no-op recorder.
+          # Two things check-turnip-darwin-host.py does not do for the newer driver sources, both supplied from the
+          # driver's own files rather than by hand:
+          #   1. The core list it compiles omits NativeAdrenoPool and NativeAdrenoPreempt, which NativeAdrenoMemory
+          #      and NativeAdrenoSubmit already call into, so the link fails on their symbols
+          #      (run #43052269535).
+          #   2. NativeAdrenoPool.h names tests/HostKernelHooks.cpp as the host double for the kernel services under
+          #      the allocator. That file defines PE_parse_boot_argn, native_gpu_dcvs, native_adreno_now_us,
+          #      native_gpu_trace_record, NativeAdrenoPoolMapRange and NativeAdrenoPoolScrub, all weak, and it is
+          #      not in the link either. Hand-writing those into host_iokit_shim.cpp does not work: the header
+          #      declares the pool calls as C++ functions, so a definition in the shim's extern "C" block comes out
+          #      with a different mangled name (run #43068051010).
           python3 - <<'PY'
           import pathlib
 
-          shim = pathlib.Path('drivers/Adreno740/tests/hostsim/host_iokit_shim.cpp')
-          text = shim.read_text()
-          marker = 'extern "C" {\nvolatile uint32_t native_gpu_dcvs[15];'
-          if marker not in text:
-              raise SystemExit('host_iokit_shim.cpp no longer ends with the board-symbol block this step extends')
-          if '#include <mach/mach_time.h>' not in text:
-              text = text.replace('#include <mach/mach.h>', '#include <mach/mach.h>\n#include <mach/mach_time.h>', 1)
-          addition = (
-              '\n/* Board symbols the newer driver sources name, absent from the host: a monotonic clock and a recorder\n'
-              ' * that drops its records, since this Mac has no GPU and no trace ring, and the pool\'s mapping and\n'
-              ' * scrub calls, which the kernel answers by mapping the run and zero-filling it; here the run is host\n'
-              ' * memory the caller already owns, so the mapping is the address and the scrub is a memset. */\n'
-              'uint64_t native_adreno_now_us(void) {return (uint64_t)(mach_absolute_time() / 1000);}\n'
-              'void native_gpu_trace_record(uint32_t event, uint32_t pid, const uint64_t *values, uint32_t count)\n'
-              '    {(void)event; (void)pid; (void)values; (void)count;}\n'
-              'void *NativeAdrenoPoolMapRange(uint64_t physical, size_t bytes, void **owner)\n'
-              '    {(void)bytes; if (owner) *owner = 0; return (void *)(uintptr_t)physical;}\n'
-              'IOReturn NativeAdrenoPoolScrub(void *mapping, size_t bytes, bool drop_lines)\n'
-              '    {(void)drop_lines; if (mapping) memset(mapping, 0, bytes); return KERN_SUCCESS;}\n')
-          shim.write_text(text.replace(marker, marker + addition, 1))
-          # The core list check-turnip-darwin-host.py compiles omits two sources the newer driver links against:
-          # NativeAdrenoMemory calls NativeAdrenoPoolAllocate, -Release and -Contains, and NativeAdrenoRing and
-          # NativeAdrenoSubmit call NativeAdrenoPreempt. The link then fails on exactly those symbols, so the list
-          # gains the two files rather than the shim gaining fake definitions for real functionality.
           host_check = pathlib.Path('scripts/check-turnip-darwin-host.py')
           text = host_check.read_text()
           old = "'NativeAdrenoUserClient', 'NativeAdrenoTimer', 'NativeAdrenoSmmuContext', 'NativeAdrenoGpuContext']:"
@@ -1040,7 +1023,22 @@ jobs:
                  "             'NativeAdrenoPool', 'NativeAdrenoPreempt']:")
           if old not in text:
               raise SystemExit('check-turnip-darwin-host.py no longer has the core list this step extends')
-          host_check.write_text(text.replace(old, new, 1))
+          text = text.replace(old, new, 1)
+          # The host double goes in beside the shim object, in both the compile and the link.
+          old_shim = ("shim_obj = out / 'host_iokit_shim.o'\n"
+                      "subprocess.run(['xcrun', 'clang++', '-std=c++17', '-O1', '-fPIC', '-c', sim / 'host_iokit_shim.cpp', '-o', shim_obj], check=True)")
+          new_shim = ("shim_obj = out / 'host_iokit_shim.o'\n"
+                      "subprocess.run(['xcrun', 'clang++', '-std=c++17', '-O1', '-fPIC', '-c', sim / 'host_iokit_shim.cpp', '-o', shim_obj], check=True)\n"
+                      "hooks_obj = out / 'HostKernelHooks.o'\n"
+                      "subprocess.run(['xcrun', 'clang++', '-std=c++17', '-O1', '-fPIC', '-I', kit, '-c', kit / 'tests/HostKernelHooks.cpp', '-o', hooks_obj], check=True)")
+          if old_shim not in text:
+              raise SystemExit('check-turnip-darwin-host.py no longer builds host_iokit_shim.o where this step expects')
+          text = text.replace(old_shim, new_shim, 1)
+          old_link = "shim_obj, *core, *objects,"
+          if old_link not in text:
+              raise SystemExit('check-turnip-darwin-host.py no longer links shim_obj where this step expects')
+          text = text.replace(old_link, "shim_obj, hooks_obj, *core, *objects,", 1)
+          host_check.write_text(text)
           PY
           python3 scripts/build-adreno-metal-bridge.py
           python3 scripts/build-adreno-metal-plugin.py --target ios
