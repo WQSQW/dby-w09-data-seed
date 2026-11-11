@@ -888,7 +888,7 @@ jobs:
           PY
           git -C "$work" diff --stat HEAD | tail -5
 
-      - name: Build the Adreno Metal plug-in
+      - name: Install the toolchain the GPU builders name
         if: inputs.gpu_plugin
         run: |
           # Three products, in the order the builders demand them: Turnip (Mesa's Adreno Vulkan driver compiled for
@@ -904,6 +904,9 @@ jobs:
           # /opt/homebrew/opt/llvm/bin first) and runs cargo +1.98.0.
           brew list llvm >/dev/null 2>&1 || brew install llvm
           if ! rustup toolchain list | grep -q '^1\.98\.0'; then rustup toolchain install 1.98.0; fi
+          # The bridge is built for arm64-apple-ios17.0, and rustc needs that target's core installed for the
+          # pinned toolchain or every crate fails with "can't find crate for core".
+          rustup target add aarch64-apple-ios --toolchain 1.98.0
           /opt/homebrew/opt/llvm/bin/llvm-as --version | head -2
           cargo +1.98.0 --version
           python3 -m venv .cache/mesa-venv
@@ -939,7 +942,7 @@ jobs:
           .cache/mesa-venv/bin/meson --version
           glslangValidator --version | head -2
 
-      - name: Check out the pinned metal2vulkan translator
+      - name: Check out the pinned metal2vulkan translator and build the plug-in
         if: inputs.gpu_plugin
         run: |
           set -euo pipefail
