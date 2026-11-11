@@ -1030,7 +1030,8 @@ jobs:
           new_shim = ("shim_obj = out / 'host_iokit_shim.o'\n"
                       "subprocess.run(['xcrun', 'clang++', '-std=c++17', '-O1', '-fPIC', '-c', sim / 'host_iokit_shim.cpp', '-o', shim_obj], check=True)\n"
                       "hooks_obj = out / 'HostKernelHooks.o'\n"
-                      "subprocess.run(['xcrun', 'clang++', '-std=c++17', '-O1', '-fPIC', '-I', kit, '-c', kit / 'tests/HostKernelHooks.cpp', '-o', hooks_obj], check=True)")
+                      "subprocess.run(['xcrun', 'clang++', '-std=c++23', '-O1', '-fPIC', '-I', includes, '-I', sim.parent, '-I', kit, '-I', smmu,\n"
+                      "                '-I', ROOT / 'kits/AdrenoPM4', '-c', kit / 'tests/HostKernelHooks.cpp', '-o', hooks_obj], check=True)")
           if old_shim not in text:
               raise SystemExit('check-turnip-darwin-host.py no longer builds host_iokit_shim.o where this step expects')
           text = text.replace(old_shim, new_shim, 1)
