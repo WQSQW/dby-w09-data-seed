@@ -853,7 +853,10 @@ jobs:
           . "$RUNNER_TEMP/mesa-pin.env"
           work="$GITHUB_WORKSPACE/.cache/mesa-work"
           git clone --filter=blob:none --no-checkout --depth 1 "$MESA_MIRROR" "$work"
-          git -C "$work" sparse-checkout set --no-cone $MESA_SPARSE
+          # The pin's sparse list names directories only, and a non-cone pattern of directories alone leaves the
+          # tree root empty. Two root files are load-bearing: meson.build and meson.options are what the first
+          # recorded patch edits, and meson must read them to configure at all.
+          git -C "$work" sparse-checkout set --no-cone $MESA_SPARSE '/meson.build' '/meson.options' '/VERSION'
           git -C "$work" fetch --depth 1 origin "$MESA_COMMIT"
           git -C "$work" checkout --detach "$MESA_COMMIT"
           # The build compares this against the pin itself, so print what it will see instead of trusting the above.
