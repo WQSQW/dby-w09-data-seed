@@ -838,7 +838,6 @@ jobs:
           # scripts/build-turnip-darwin.py opens .cache/mesa-work and refuses to run unless its HEAD is the commit
           # pinned in scripts/data/adreno-compiler-inputs.json. No script in this repository creates that checkout:
           # docs/zh/porting/migration.md lists it as a local build input the operator supplies, so it is fetched here.
-          # The sparse directory list is the pin's own, and a partial clone keeps the download to what the build reads.
           python3 - "$GITHUB_WORKSPACE" <<'PY' >"$RUNNER_TEMP/mesa-pin.env"
           import json
           import pathlib
@@ -848,15 +847,14 @@ jobs:
           pins = json.loads((pathlib.Path(sys.argv[1]) / 'scripts/data/adreno-compiler-inputs.json').read_text())['mesa']
           print('MESA_COMMIT=' + shlex.quote(pins['commit']))
           print('MESA_MIRROR=' + shlex.quote(pins['mirror']))
-          print('MESA_SPARSE=' + shlex.quote(' '.join(pins['sparse_directories'])))
           PY
           . "$RUNNER_TEMP/mesa-pin.env"
           work="$GITHUB_WORKSPACE/.cache/mesa-work"
           git clone --filter=blob:none --no-checkout --depth 1 "$MESA_MIRROR" "$work"
-          # The pin's sparse list names directories only, and a non-cone pattern of directories alone leaves the
-          # tree root empty. Two root files are load-bearing: meson.build and meson.options are what the first
-          # recorded patch edits, and meson must read them to configure at all.
-          git -C "$work" sparse-checkout set --no-cone $MESA_SPARSE '/meson.build' '/meson.options' '/VERSION'
+          # The whole tree, not the pin's sparse_directories list: meson walks subdir() through src/meson.build and
+          # every intermediate meson.build below it, and a directory-only sparse pattern leaves those out - run
+          # #43008392850 configured to "Nonexistent build file 'src/meson.build'". No script in this repository
+          # reads that list, so it is not a build input; a blob-filtered single-commit clone is cheap enough whole.
           git -C "$work" fetch --depth 1 origin "$MESA_COMMIT"
           git -C "$work" checkout --detach "$MESA_COMMIT"
           # The build compares this against the pin itself, so print what it will see instead of trusting the above.
