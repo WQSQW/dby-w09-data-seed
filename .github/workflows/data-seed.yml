@@ -860,6 +860,18 @@ jobs:
           # The build compares this against the pin itself, so print what it will see instead of trusting the above.
           git -C "$work" rev-parse HEAD
           test "$(git -C "$work" rev-parse HEAD)" = "$MESA_COMMIT"
+          # tu_knl_darwin.cc includes NativeAdrenoABI.h and build-turnip-darwin.py points the include search at
+          # drivers/NativeAdreno, while the driver submodule is drivers/Adreno740 (the .gitmodules entry and the
+          # only Adreno driver directory in either tree): run #43011619527 died on "'NativeAdrenoABI.h' file not
+          # found" against an empty drivers/Adreno740. Submodules are initialised the way the seed steps
+          # initialise drivers/DarwinBoot, and the two directories the build steps still name by their old names
+          # point at the real ones - build-adreno-metal-plugin.py also reads NativeAdrenoMetalPlugin.mm and
+          # NativeAdrenoProbeDaemon.cpp from drivers/NativeMetal - rather than the upstream scripts being edited.
+          git submodule update --init --depth 1 drivers/Adreno740 drivers/AdrenoMetal kits/AdrenoPM4
+          test -f drivers/Adreno740/NativeAdrenoABI.h
+          test -f drivers/AdrenoMetal/NativeAdrenoMetalPlugin.mm
+          ln -sfn Adreno740 drivers/NativeAdreno
+          ln -sfn AdrenoMetal drivers/NativeMetal
           # scripts/mesa_patch_identity.py reverse-applies the recorded patches to prove the tree carries exactly
           # them, and rejects any change the pin does not name. They are applied here in the pin's order.
           python3 - "$GITHUB_WORKSPACE" "$work" <<'PY'
