@@ -1018,10 +1018,16 @@ jobs:
               text = text.replace('#include <mach/mach.h>', '#include <mach/mach.h>\n#include <mach/mach_time.h>', 1)
           addition = (
               '\n/* Board symbols the newer driver sources name, absent from the host: a monotonic clock and a recorder\n'
-              ' * that drops its records, since this Mac has no GPU and no trace ring. */\n'
+              ' * that drops its records, since this Mac has no GPU and no trace ring, and the pool\'s mapping and\n'
+              ' * scrub calls, which the kernel answers by mapping the run and zero-filling it; here the run is host\n'
+              ' * memory the caller already owns, so the mapping is the address and the scrub is a memset. */\n'
               'uint64_t native_adreno_now_us(void) {return (uint64_t)(mach_absolute_time() / 1000);}\n'
               'void native_gpu_trace_record(uint32_t event, uint32_t pid, const uint64_t *values, uint32_t count)\n'
-              '    {(void)event; (void)pid; (void)values; (void)count;}\n')
+              '    {(void)event; (void)pid; (void)values; (void)count;}\n'
+              'void *NativeAdrenoPoolMapRange(uint64_t physical, size_t bytes, void **owner)\n'
+              '    {(void)bytes; if (owner) *owner = 0; return (void *)(uintptr_t)physical;}\n'
+              'IOReturn NativeAdrenoPoolScrub(void *mapping, size_t bytes, bool drop_lines)\n'
+              '    {(void)drop_lines; if (mapping) memset(mapping, 0, bytes); return KERN_SUCCESS;}\n')
           shim.write_text(text.replace(marker, marker + addition, 1))
           # The core list check-turnip-darwin-host.py compiles omits two sources the newer driver links against:
           # NativeAdrenoMemory calls NativeAdrenoPoolAllocate, -Release and -Contains, and NativeAdrenoRing and
