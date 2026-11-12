@@ -1105,8 +1105,18 @@ jobs:
             curl -fsSL --retry 3 \
               "https://raw.githubusercontent.com/UniXNU/UniXNU-sheng/main/scripts/check-quartzcore-turnip-cache-host.py" \
               -o scripts/check-quartzcore-turnip-cache-host.py
+            # That script predates the rename that made this tree's bridge adreno-metal-bridge, so it asks for
+            # build/native-metal-bridge/host/libnative_metal_bridge.a, which nothing here produces. The name is
+            # corrected to the one build-adreno-metal-bridge.py writes.
+            sed -i '' \
+              -e 's|build/native-metal-bridge/host/libnative_metal_bridge\.a|build/adreno-metal-bridge/host/libadreno_metal_bridge.a|g' \
+              scripts/check-quartzcore-turnip-cache-host.py
           fi
           test -f scripts/check-quartzcore-turnip-cache-host.py
+          grep -q 'build/adreno-metal-bridge/host/libadreno_metal_bridge.a' scripts/check-quartzcore-turnip-cache-host.py
+          # The same script needs the host build of the bridge; build-adreno-metal-bridge.py defaults to ios.
+          test -f build/adreno-metal-bridge/host/libadreno_metal_bridge.a ||
+            python3 scripts/build-adreno-metal-bridge.py --target host
           python3 scripts/build-adreno-metal-bridge.py
           python3 scripts/build-adreno-metal-plugin.py --target ios
           ls -l build/adreno-metal-plugin/ | tail -30
